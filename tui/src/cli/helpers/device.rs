@@ -61,7 +61,8 @@ pub async fn setup_device(args: &CliArgs, state: &mut PersistedDeviceState) -> R
     let mut builder = DeviceBuilder::default()
         .with_mtk_port(mtk_port)
         .with_verbose(args.verbose)
-        .with_usb_log_channel(usb_log_channel);
+        .with_usb_log_channel(usb_log_channel)
+        .with_force_heapb8(args.force_heapb8);
 
     if usb_log_channel {
         if let Some(device_log) = setup_file_logger(DA_LOG_FILE).await {

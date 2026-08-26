@@ -429,6 +429,18 @@ impl DownloadProtocol for XFlash {
     }
 
     #[cfg(not(feature = "no_exploits"))]
+    fn verify_derived_rpmb_key(&mut self, region: RpmbRegion) -> Result<()> {
+        crate::da::xflash::exts::verify_derived_rpmb_key(self, region)
+    }
+
+    #[cfg(not(feature = "no_exploits"))]
+    fn get_rpmb_sector_count(&mut self, _region: RpmbRegion) -> Result<u32> {
+        let size = self.get_storage().map_or(0, |storage| storage.get_rpmb_size());
+        u32::try_from(size / 256)
+            .map_err(|_| Error::penumbra("RPMB sector count does not fit in u32"))
+    }
+
+    #[cfg(not(feature = "no_exploits"))]
     fn patch_da(&mut self) -> Option<DA> {
         patch::patch_da(self).ok()
     }

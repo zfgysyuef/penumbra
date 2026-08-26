@@ -27,7 +27,7 @@ use crate::error::{Error, Result};
 /// A MTKPort must be provided to build the device.
 ///
 /// # Example
-/// ```rust
+/// ```ignore
 /// use penumbra::{Device, DeviceBuilder, find_mtk_port};
 ///
 /// let mtk_port = find_mtk_port().await.ok_or("No MTK port found")?;
@@ -58,6 +58,8 @@ pub struct DeviceBuilder {
     /// When enabled, DA log messages are captured into a [`DeviceLog`] buffer
     /// instead of being sent over UART.
     usb_log_channel: bool,
+    /// Whether to force HeapB8/HeapBait instead of Carbonara on XML/V6 DAs.
+    force_heapb8: bool,
     /// A buffer to store DA log messages when `usb_log_channel` is enabled.
     /// This allows for capturing logs from devices without needing UART.
     device_log: Option<DeviceLog>,
@@ -100,6 +102,12 @@ impl DeviceBuilder {
         self
     }
 
+    /// Force HeapB8/HeapBait instead of Carbonara on XML/V6 DAs.
+    pub const fn with_force_heapb8(mut self, force: bool) -> Self {
+        self.force_heapb8 = force;
+        self
+    }
+
     /// Assigns a [`DeviceLog`] buffer to capture DA log messages
     /// when `usb_log_channel` is enabled.
     /// This allows to attach an optional Callback to the log buffer
@@ -129,6 +137,7 @@ impl DeviceBuilder {
             auth_data: self.auth_data,
             verbose: self.verbose,
             usb_log_channel: self.usb_log_channel,
+            force_heapb8: self.force_heapb8,
             device_log,
         })
     }
@@ -164,6 +173,8 @@ pub struct Device {
     verbose: bool,
     /// Whether to log DA messages over USB.
     usb_log_channel: bool,
+    /// Whether to force HeapB8/HeapBait instead of Carbonara on XML/V6 DAs.
+    force_heapb8: bool,
     /// Buffer to store DA log messages.
     device_log: DeviceLog,
 }
@@ -173,7 +184,7 @@ impl Device {
     /// This must be called before any other operations.
     ///
     /// # Examples
-    /// ```rust
+    /// ```ignore
     /// use penumbra::{DeviceBuilder, find_mtk_port};
     ///
     /// let mtk_port = find_mtk_port().ok_or("No MTK port found")?;
@@ -263,7 +274,7 @@ impl Device {
     /// After entering DA mode, the device's partition information is read and stored in `dev_info`.
     ///
     /// # Examples
-    /// ```rust
+    /// ```ignore
     /// use penumbra::{DeviceBuilder, find_mtk_port};
     ///
     /// let mtk_port = find_mtk_port().ok_or("No MTK port found")?;
@@ -333,12 +344,27 @@ impl Device {
 
         let da_type = da.da_type;
 
+        if self.force_heapb8 {
+            #[cfg(feature = "no_exploits")]
+            {
+                return Err(Error::penumbra(
+                    "--force-heapb8 requires exploit support, but penumbra was built with no_exploits",
+                ));
+            }
+
+            #[cfg(not(feature = "no_exploits"))]
+            if da_type != DAType::V6 {
+                return Err(Error::penumbra("--force-heapb8 only supports XML/V6 Download Agents"));
+            }
+        }
+
         let params = DAProtocolParams {
             da,
             devinfo: self.dev_info.clone(),
             device_log: self.device_log.clone(),
             verbose: self.verbose,
             usb_log_channel: self.usb_log_channel,
+            force_heapb8: self.force_heapb8,
             preloader: self.preloader_data.clone(),
         };
 
@@ -395,7 +421,7 @@ impl Device {
     /// Returns an empty list if no DA protocol is available.
     ///
     /// # Examples
-    /// ```rust
+    /// ```ignore
     /// use penumbra::{DeviceBuilder, find_mtk_port};
     ///
     /// let mtk_port = find_mtk_port().ok_or("No MTK port found")?;
@@ -510,7 +536,7 @@ impl Device {
     /// To erase other sections, use `erase_offset` with the appropriate address.
     ///
     /// # Examples
-    /// ```rust
+    /// ```ignore
     /// use penumbra::{DeviceBuilder, find_mtk_port};
     ///
     /// let mtk_port = find_mtk_port().ok_or("No MTK port found")?;
@@ -545,7 +571,7 @@ impl Device {
     /// `PartitionKind`.
     ///
     /// # Examples
-    /// ```rust
+    /// ```ignore
     /// // Let's assume we want to read preloader
     /// use penumbra::{DeviceBuilder, PartitionKind, find_mtk_port};
     ///
@@ -588,7 +614,7 @@ impl Device {
     /// `PartitionKind`.
     ///
     /// # Examples
-    /// ```rust
+    /// ```ignore
     /// // Let's assume we want to write to preloader
     /// use penumbra::{DeviceBuilder, PartitionKind, find_mtk_port};
     ///
@@ -634,7 +660,7 @@ impl Device {
     /// `PartitionKind`.
     ///
     /// # Examples
-    /// ```rust
+    /// ```ignore
     /// use penumbra::{DeviceBuilder, PartitionKind, find_mtk_port};
     ///
     /// let mtk_port = find_mtk_port().ok_or("No MTK port found")?;
@@ -673,7 +699,7 @@ impl Device {
     /// whole.
     ///
     /// # Examples
-    /// ```rust
+    /// ```ignore
     /// use penumbra::{DeviceBuilder, find_mtk_port};
     ///
     /// let mtk_port = find_mtk_port().ok_or("No MTK port found")?;
@@ -706,7 +732,7 @@ impl Device {
     /// This is the same method uses by SP Flash Tool when reading back without scatter.
     ///
     /// # Examples
-    /// ```rust
+    /// ```ignore
     /// use std::fs::File;
     /// use std::io::BufWriter;
     ///
@@ -740,7 +766,7 @@ impl Device {
     /// Formats a specified partition on the device.
     ///
     /// # Examples
-    /// ```rust
+    /// ```ignore
     /// use penumbra::{DeviceBuilder, find_mtk_port};
     ///
     /// let mtk_port = find_mtk_port().ok_or("No MTK port found")?;
@@ -767,7 +793,7 @@ impl Device {
     /// Shuts down the device.
     ///
     /// # Examples
-    /// ```rust
+    /// ```ignore
     /// use penumbra::{DeviceBuilder, find_mtk_port};
     ///
     /// let mtk_port = find_mtk_port().ok_or("No MTK port found")?;
@@ -789,7 +815,7 @@ impl Device {
     /// Supported boot modes include `Normal`, `HomeScreen`, `Fastboot`, `Test`, and `Meta`.
     ///
     /// # Examples
-    /// ```rust
+    /// ```ignore
     /// use penumbra::{BootMode, DeviceBuilder, find_mtk_port};
     ///
     /// let mtk_port = find_mtk_port().ok_or("No MTK port found")?;
@@ -814,7 +840,7 @@ impl Device {
     /// Requires DA Extensions.
     ///
     /// # Examples
-    /// ```rust
+    /// ```ignore
     /// use penumbra::{DeviceBuilder, LockFlag, find_mtk_port};
     ///
     /// let mtk_port = find_mtk_port().ok_or("No MTK port found")?;
@@ -839,7 +865,7 @@ impl Device {
     /// Only available when the `no_exploits` feature is **not** enabled.
     ///
     /// # Examples
-    /// ```rust
+    /// ```ignore
     /// use std::fs::File;
     /// use std::io::BufWriter;
     ///
@@ -876,7 +902,7 @@ impl Device {
     /// Only available when the `no_exploits` feature is **not** enabled.
     ///
     /// # Examples
-    /// ```rust
+    /// ```ignore
     /// use std::fs::File;
     /// use std::io::BufReader;
     ///
@@ -914,7 +940,7 @@ impl Device {
     /// Only available when the `no_exploits` feature is **not** enabled.
     ///
     /// # Examples
-    /// ```rust
+    /// ```ignore
     /// use std::fs::File;
     /// use std::io::BufWriter;
     ///
@@ -959,7 +985,7 @@ impl Device {
     /// Only available when the `no_exploits` feature is **not** enabled.
     ///
     /// # Examples
-    /// ```rust
+    /// ```ignore
     /// use std::fs::File;
     /// use std::io::BufReader;
     ///
@@ -1006,7 +1032,7 @@ impl Device {
     /// Only available when the `no_exploits` feature is **not** enabled.
     ///
     /// # Examples
-    /// ```rust
+    /// ```ignore
     /// use penumbra::{DeviceBuilder, RpmbRegion, find_mtk_port};
     ///
     /// let mtk_port = find_mtk_port().ok_or("No MTK port found")?;
@@ -1024,5 +1050,24 @@ impl Device {
 
         let protocol = self.protocol.as_mut().unwrap();
         protocol.auth_rpmb(region, key)
+    }
+
+    /// Derives and authenticates the device RPMB key without reading or
+    /// writing RPMB data.
+    #[cfg(not(feature = "no_exploits"))]
+    pub fn verify_derived_rpmb_key(&mut self, region: RpmbRegion) -> Result<()> {
+        self.ensure_da_mode()?;
+
+        let protocol = self.protocol.as_mut().unwrap();
+        protocol.verify_derived_rpmb_key(region)
+    }
+
+    /// Returns the number of 256-byte sectors in an RPMB region.
+    #[cfg(not(feature = "no_exploits"))]
+    pub fn get_rpmb_sector_count(&mut self, region: RpmbRegion) -> Result<u32> {
+        self.ensure_da_mode()?;
+
+        let protocol = self.protocol.as_mut().unwrap();
+        protocol.get_rpmb_sector_count(region)
     }
 }

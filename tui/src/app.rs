@@ -37,6 +37,7 @@ pub struct AppCtx {
     config: AntumbraConfig,
     pub theme: Theme,
     pub dialog: Option<Dialog>,
+    force_heapb8: bool,
 }
 
 pub struct App {
@@ -149,6 +150,10 @@ impl AppCtx {
     pub fn config(&mut self) -> &mut AntumbraConfig {
         &mut self.config
     }
+
+    pub const fn force_heapb8(&self) -> bool {
+        self.force_heapb8
+    }
 }
 
 impl Default for AppCtx {
@@ -170,6 +175,7 @@ impl Default for AppCtx {
             config,
             theme,
             dialog: None,
+            force_heapb8: false,
         }
     }
 }
@@ -177,6 +183,7 @@ impl Default for AppCtx {
 impl App {
     pub fn new(args: &CliArgs) -> App {
         let mut ctx = AppCtx::default();
+        ctx.force_heapb8 = args.force_heapb8;
 
         if let Some(da_path) = &args.da_file
             && let Ok(raw_data) = read(da_path)

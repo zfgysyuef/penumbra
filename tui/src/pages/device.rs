@@ -2,8 +2,9 @@
     SPDX-License-Identifier: AGPL-3.0-or-later
     SPDX-FileCopyrightText: 2025-2026 Shomy
 */
-use penumbra::StorageKind;
 use std::collections::{HashMap, HashSet};
+use std::fs::File;
+use std::io::{BufReader, BufWriter};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -14,7 +15,7 @@ use human_bytes::human_bytes;
 use penumbra::core::devinfo::DevInfoData;
 use penumbra::core::seccfg::LockFlag;
 use penumbra::core::storage::{Partition, Storage};
-use penumbra::{Device, DeviceBuilder, find_mtk_port};
+use penumbra::{Device, DeviceBuilder, StorageKind, find_mtk_port};
 #[cfg(target_os = "windows")]
 use ratatui::crossterm::event::KeyEventKind;
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
@@ -23,8 +24,6 @@ use ratatui::prelude::{Alignment, Frame};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Row, Table};
-use std::fs::File;
-use std::io::{BufReader, BufWriter};
 use strum::IntoEnumIterator;
 use strum_macros::{AsRefStr, EnumIter};
 use tokio::spawn;
@@ -34,10 +33,18 @@ use tokio::time::{Duration, sleep};
 
 use crate::app::{AppCtx, AppPage};
 use crate::components::selectable_list::{
-    ListItemEntry, ListItemEntryBuilder, SelectableList, SelectableListBuilder,
+    ListItemEntry,
+    ListItemEntryBuilder,
+    SelectableList,
+    SelectableListBuilder,
 };
 use crate::components::{
-    ExplorerResult, FileExplorer, ProgressBar, Stars, ThemedWidgetMut, ThemedWidgetRef,
+    ExplorerResult,
+    FileExplorer,
+    ProgressBar,
+    Stars,
+    ThemedWidgetMut,
+    ThemedWidgetRef,
 };
 use crate::pages::Page;
 
@@ -399,6 +406,7 @@ impl DevicePage {
 
         let da_data = ctx.loader().map(|da| da.file().da_raw_data.clone());
         let pl_data = ctx.preloader().map(|pl| pl.data());
+        let force_heapb8 = ctx.force_heapb8();
 
         spawn(async move {
             let port = loop {
@@ -409,7 +417,8 @@ impl DevicePage {
             };
             let _ = tx.send(DeviceEvent::StatusChanged(DeviceStatus::Connecting)).await;
 
-            let mut devbuilder = DeviceBuilder::default().with_mtk_port(port);
+            let mut devbuilder =
+                DeviceBuilder::default().with_mtk_port(port).with_force_heapb8(force_heapb8);
 
             if let Some(da) = da_data {
                 devbuilder = devbuilder.with_da_data(da);

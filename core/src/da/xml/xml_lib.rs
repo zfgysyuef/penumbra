@@ -46,8 +46,10 @@ pub struct Xml {
     #[allow(dead_code)]
     pub(super) read_packet_length: Option<usize>,
     pub(super) write_packet_length: Option<usize>,
+    pub(super) rpmb_authenticated_regions: u8,
     pub(super) patch: bool,
     pub(super) verbose: bool,
+    pub(super) force_heapb8: bool,
     pub(super) usb_log_channel: bool,
     pub(super) device_log: DeviceLog,
 }
@@ -61,8 +63,10 @@ impl Xml {
             using_exts: false,
             read_packet_length: None,
             write_packet_length: None,
+            rpmb_authenticated_regions: 0,
             patch: true,
             verbose: params.verbose,
+            force_heapb8: params.force_heapb8,
             usb_log_channel: params.usb_log_channel,
             device_log: params.device_log,
         }
@@ -135,7 +139,7 @@ impl Xml {
         if data.windows(20).any(|window| window == b"<result>ERR</result>") {
             // We need to ack before returning, or the device will hang.
             self.ack(None)?;
-            return Ok(false);
+            return Err(Error::proto("Device command reported ERR"));
         }
 
         Ok(data.windows(pattern.len()).any(|window| window == pattern))
@@ -156,17 +160,32 @@ impl Xml {
     pub fn read_ack(&mut self) -> Result<()> {
         let resp = self.read_data()?;
         let s = String::from_utf8_lossy(&resp);
+        let ack = s.trim_end_matches('\0').trim();
 
-        // Check for OK or OK@0x0 (Ok with error code 0)
-        if s == "OK\u{0}" || s == "OK@0x0\u{0}" {
+        if ack == "OK" {
             return Ok(());
+        }
+
+        if let Some(status) = ack.strip_prefix("OK@0x") {
+            let status = u32::from_str_radix(status, 16)
+                .map_err(|_| Error::proto(format!("Invalid status acknowledgment: {ack}")))?;
+
+            if status == 0 {
+                return Ok(());
+            }
+
+            return Err(Error::proto(format!("Device returned status 0x{status:08X}")));
         }
 
         if s.contains("ERR!UNSUPPORTED") {
             return Err(Error::Xml(XmlError::from_message(&resp)));
         }
 
-        Err(Error::proto("Invalid acknowledgment"))
+        if ack.starts_with("ERR") {
+            return Err(Error::proto(format!("Device returned error acknowledgment: {ack}")));
+        }
+
+        Err(Error::proto(format!("Invalid acknowledgment: {ack}")))
     }
 
     /// Acknowledges the lifetime of an XML command (CMD:START or CMD:END).

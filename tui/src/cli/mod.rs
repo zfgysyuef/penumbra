@@ -39,6 +39,10 @@ pub struct CliArgs {
     /// Enable USB DA logging
     #[arg(long = "usb-log", global = true)]
     pub usb_log: bool,
+    /// Force HeapB8/HeapBait instead of Carbonara on XML/V6 DAs
+    #[arg(long = "force-heapb8", global = true)]
+    pub force_heapb8: bool,
+
     /// Subcommands for CLI mode. If provided, TUI mode will be disabled.
     #[command(subcommand)]
     pub command: Option<Commands>,
@@ -90,4 +94,98 @@ pub async fn run_cli(args: &CliArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::*;
+    use crate::cli::commands::device::rpmb::RpmbCommand;
+
+    #[test]
+    fn parses_force_heapb8_global_flag() {
+        let args = CliArgs::try_parse_from(["antumbra", "--force-heapb8"]).unwrap();
+
+        assert!(args.force_heapb8);
+        assert!(args.command.is_none());
+    }
+
+    #[test]
+    fn parses_top_level_rpmb_read_types() {
+        let args = CliArgs::try_parse_from([
+            "antumbra",
+            "rpmb",
+            "read",
+            "--start-sector",
+            "256",
+            "--num-sectors",
+            "200",
+            "rpmb.bin",
+        ])
+        .unwrap();
+
+        let Some(Commands::Rpmb(rpmb)) = args.command else {
+            panic!("expected top-level RPMB command");
+        };
+        let RpmbCommand::Read(read) = rpmb.command else {
+            panic!("expected RPMB read command");
+        };
+        assert_eq!(read.start_sector, 256);
+        assert_eq!(read.num_sectors, Some(200));
+    }
+
+    #[test]
+    fn parses_top_level_verify_derived() {
+        let args = CliArgs::try_parse_from([
+            "antumbra",
+            "rpmb",
+            "verify-derived",
+            "--region",
+            "1",
+        ])
+        .unwrap();
+
+        let Some(Commands::Rpmb(rpmb)) = args.command else {
+            panic!("expected top-level RPMB command");
+        };
+        let RpmbCommand::VerifyDerived(verify) = rpmb.command else {
+            panic!("expected RPMB verify-derived command");
+        };
+        assert_eq!(verify.region, 1);
+    }
+
+    #[test]
+    fn parses_top_level_rpmb_erase() {
+        let args = CliArgs::try_parse_from([
+            "antumbra",
+            "rpmb",
+            "erase",
+            "--region",
+            "0",
+        ])
+        .unwrap();
+
+        let Some(Commands::Rpmb(rpmb)) = args.command else {
+            panic!("expected top-level RPMB command");
+        };
+        let RpmbCommand::Erase(erase) = rpmb.command else {
+            panic!("expected RPMB erase command");
+        };
+        assert_eq!(erase.region, Some(0));
+        assert!(!erase.all_regions);
+    }
+
+    #[test]
+    fn parses_top_level_rpmb_info_without_scope_flag() {
+        let args = CliArgs::try_parse_from(["antumbra", "rpmb", "info"]).unwrap();
+
+        let Some(Commands::Rpmb(rpmb)) = args.command else {
+            panic!("expected top-level RPMB command");
+        };
+        let RpmbCommand::Info(info) = rpmb.command else {
+            panic!("expected RPMB info command");
+        };
+        assert_eq!(info.region, None);
+    }
 }

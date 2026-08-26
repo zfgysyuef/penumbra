@@ -240,6 +240,10 @@ fn init_rpmb(xflash: &mut XFlash, region: RpmbRegion) -> Result<()> {
     Ok(())
 }
 
+pub fn verify_derived_rpmb_key(xflash: &mut XFlash, region: RpmbRegion) -> Result<()> {
+    init_rpmb(xflash, region)
+}
+
 pub fn read_rpmb<W, F>(
     xflash: &mut XFlash,
     region: RpmbRegion,
@@ -261,10 +265,18 @@ where
         }
     };
 
+    if sectors_count == 0 {
+        return Err(Error::penumbra("RPMB sector count must be greater than 0"));
+    }
+
     let rpmb_size = storage.get_rpmb_size();
-    let max_sectors = (rpmb_size / RPMB_FRAME_DATA_SZ as u64) as u32;
-    if start_sector.checked_add(sectors_count).is_none_or(|end| end > max_sectors) {
-        return Err(Error::penumbra("Requested RPMB read range is out of bounds"));
+    if rpmb_size != 0 {
+        let max_sectors = (rpmb_size / RPMB_FRAME_DATA_SZ as u64) as u32;
+        if start_sector.checked_add(sectors_count).is_none_or(|end| end > max_sectors) {
+            return Err(Error::penumbra("Requested RPMB read range is out of bounds"));
+        }
+    } else {
+        info!("Device reports unknown RPMB size; skipping RPMB bounds check");
     }
 
     let mut sector_range = [0u8; 8];
@@ -302,10 +314,18 @@ where
         }
     };
 
+    if sectors_count == 0 {
+        return Err(Error::penumbra("RPMB sector count must be greater than 0"));
+    }
+
     let rpmb_size = storage.get_rpmb_size();
-    let max_sectors = (rpmb_size / RPMB_FRAME_DATA_SZ as u64) as u32;
-    if start_sector.checked_add(sectors_count).is_none_or(|end| end > max_sectors) {
-        return Err(Error::penumbra("Requested RPMB write range is out of bounds"));
+    if rpmb_size != 0 {
+        let max_sectors = (rpmb_size / RPMB_FRAME_DATA_SZ as u64) as u32;
+        if start_sector.checked_add(sectors_count).is_none_or(|end| end > max_sectors) {
+            return Err(Error::penumbra("Requested RPMB write range is out of bounds"));
+        }
+    } else {
+        info!("Device reports unknown RPMB size; skipping RPMB bounds check");
     }
 
     let mut sector_range = [0u8; 8];

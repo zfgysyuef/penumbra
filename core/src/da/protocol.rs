@@ -120,6 +120,7 @@ pub struct DAProtocolParams {
     pub device_log: DeviceLog,
     pub verbose: bool,
     pub usb_log_channel: bool,
+    pub force_heapb8: bool,
     pub preloader: Option<Vec<u8>>, // TODO: Switch to Preloader type
 }
 
@@ -266,6 +267,15 @@ pub trait DownloadProtocol {
 
     #[cfg(not(feature = "no_exploits"))]
     fn auth_rpmb(&mut self, region: RpmbRegion, key: &[u8]) -> Result<()>;
+
+    /// Derives the device RPMB key and verifies it against the authenticated
+    /// write-counter response without writing RPMB data.
+    #[cfg(not(feature = "no_exploits"))]
+    fn verify_derived_rpmb_key(&mut self, region: RpmbRegion) -> Result<()>;
+
+    /// Returns the authenticated 256-byte sector count for an RPMB region.
+    #[cfg(not(feature = "no_exploits"))]
+    fn get_rpmb_sector_count(&mut self, region: RpmbRegion) -> Result<u32>;
 
     // DA Patching utils. These *must* be protocol specific, as different protocols
     // have different DA implementations

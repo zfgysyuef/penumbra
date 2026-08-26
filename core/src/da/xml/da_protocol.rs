@@ -46,12 +46,36 @@ impl DownloadProtocol for Xml {
         self.upload_stage1(da1.addr, da1.length, da1.data.clone(), da1.sig_len)
             .map_err(|e| Error::proto(format!("Failed to upload XML DA1: {e}")))?;
 
-        exploit!(Carbonara, self);
+        let carbonara_succeeded = if self.force_heapb8 {
+            info!("[Exploit] --force-heapb8 set, keeping HeapBait enabled after DA2 hash setup");
+            let patch_before_carbonara = self.patch;
+            exploit!(Carbonara, self);
+            let succeeded = patch_before_carbonara && !self.patch;
+
+            if succeeded {
+                info!("[Exploit] Carbonara DA2 hash helper succeeded; forcing HeapBait next");
+                self.patch = true;
+            } else {
+                info!(
+                    "[Exploit] Carbonara DA2 hash helper unavailable; trying signed DA2 for HeapBait"
+                );
+            }
+
+            succeeded
+        } else {
+            exploit!(Carbonara, self);
+            false
+        };
 
         let (da2_addr, da2_data) = {
             let da2 = self.da.get_da2().ok_or_else(|| Error::penumbra("DA2 region not found"))?;
-            let sig_len = da2.sig_len as usize;
-            let data = da2.data[..da2.data.len().saturating_sub(sig_len)].to_vec();
+            let data = if self.force_heapb8 && !carbonara_succeeded {
+                info!("[Exploit] --force-heapb8 set, uploading signed XML DA2 before HeapBait");
+                da2.data.clone()
+            } else {
+                let sig_len = da2.sig_len as usize;
+                da2.data[..da2.data.len().saturating_sub(sig_len)].to_vec()
+            };
             (da2.addr, data)
         };
 
@@ -81,7 +105,7 @@ impl DownloadProtocol for Xml {
     }
 
     fn boot_to(&mut self, addr: u32, data: &[u8]) -> Result<bool> {
-        xmlcmd!(self, BootTo, addr, addr)?;
+        xmlcmd!(self, BootTo, addr, addr, data.len())?;
 
         let reader = BufReader::new(Cursor::new(data));
         let progress = |_, _| {};
@@ -345,6 +369,16 @@ impl DownloadProtocol for Xml {
     #[cfg(not(feature = "no_exploits"))]
     fn auth_rpmb(&mut self, region: RpmbRegion, key: &[u8]) -> Result<()> {
         exts::auth_rpmb(self, region, key)
+    }
+
+    #[cfg(not(feature = "no_exploits"))]
+    fn verify_derived_rpmb_key(&mut self, region: RpmbRegion) -> Result<()> {
+        exts::verify_derived_rpmb_key(self, region)
+    }
+
+    #[cfg(not(feature = "no_exploits"))]
+    fn get_rpmb_sector_count(&mut self, region: RpmbRegion) -> Result<u32> {
+        exts::get_rpmb_sector_count(self, region)
     }
 
     #[cfg(not(feature = "no_exploits"))]

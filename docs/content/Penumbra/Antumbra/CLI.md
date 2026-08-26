@@ -6,6 +6,13 @@ You'll need a [[Download Agent]] to be able to interact with the device.
 If the device has DAA, you'll need the specific DA for your device.
 If the device has SLA, you'll probably either need an engineering preloader or paid auth.
 
+If you need to force [[Heapbait|HeapB8]] on an XML/V6 DA, pass `--force-heapb8`.
+This skips Carbonara during DA1 and keeps the DA2 patch path open for HeapB8.
+
+~~~sh
+antumbra --force-heapb8 pgpt --da DA.bin
+~~~
+
 ## List all partitions
 
 ```sh

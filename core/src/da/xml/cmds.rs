@@ -57,8 +57,8 @@ pub struct BootTo {
     at_addr: u64,
     #[xml(tag = "jmp_address", fmt = "0x{jmp_addr:x}")]
     jmp_addr: u64,
-    #[xml(tag = "source_file", value = "MEM://0x0:0x0")]
-    host_offset: &'static str,
+    #[xml(tag = "source_file", fmt = "MEM://0x0:0x{length:X}")]
+    length: usize,
 }
 
 #[derive(XmlCommand)]
