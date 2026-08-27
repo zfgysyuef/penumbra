@@ -10,7 +10,7 @@ use anyhow::Result;
 use clap::Args;
 use clap_num::maybe_hex;
 use log::info;
-use penumbra::{Device, Storage};
+use penumbra::{Device, MtkPort, Storage};
 
 use crate::cli::DeviceCommand;
 use crate::cli::common::{CONN_DA, CommandMetadata};
@@ -46,7 +46,7 @@ impl CommandMetadata for WriteOffArgs {
 }
 
 impl DeviceCommand for WriteOffArgs {
-    fn run(&self, dev: &mut Device, state: &mut PersistedDeviceState) -> Result<()> {
+    fn run<P: MtkPort>(&self, dev: &mut Device<P>, state: &mut PersistedDeviceState) -> Result<()> {
         dev.enter_da_mode()?;
 
         state.connection_type = CONN_DA;
@@ -55,7 +55,7 @@ impl DeviceCommand for WriteOffArgs {
         let file = File::open(&self.input_file)?;
         let mut reader = BufReader::new(file);
 
-        let user_section = dev.dev_info.storage().unwrap().get_user_part();
+        let user_section = dev.get_storage().unwrap().get_user_part();
 
         let pb = AntumbraProgress::new(self.length as u64);
 
@@ -71,7 +71,7 @@ impl DeviceCommand for WriteOffArgs {
             &mut progress_callback,
         ) {
             pb.abandon("Write failed!");
-            return Err(e)?;
+            Err(e)?;
         };
 
         info!("Flash write completed, {:#X} bytes written.", self.length);

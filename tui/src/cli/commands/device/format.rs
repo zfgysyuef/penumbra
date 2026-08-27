@@ -6,7 +6,7 @@
 use anyhow::Result;
 use clap::Args;
 use log::info;
-use penumbra::Device;
+use penumbra::{Device, MtkPort};
 
 use crate::cli::DeviceCommand;
 use crate::cli::common::{CONN_DA, CommandMetadata};
@@ -34,13 +34,13 @@ impl CommandMetadata for FormatArgs {
 }
 
 impl DeviceCommand for FormatArgs {
-    fn run(&self, dev: &mut Device, state: &mut PersistedDeviceState) -> Result<()> {
+    fn run<P: MtkPort>(&self, dev: &mut Device<P>, state: &mut PersistedDeviceState) -> Result<()> {
         dev.enter_da_mode()?;
 
         state.connection_type = CONN_DA;
         state.flash_mode = 1;
 
-        let Some(part) = dev.dev_info.get_partition(&self.partition) else {
+        let Some(part) = dev.get_partition_active(&self.partition) else {
             return Err(anyhow::anyhow!("Partition '{}' not found on device.", self.partition));
         };
 
@@ -50,9 +50,9 @@ impl DeviceCommand for FormatArgs {
 
         info!("Formatting partition '{}'", part.name);
 
-        if let Err(e) = dev.format(&part.name, &mut progress_callback) {
+        if let Err(e) = dev.erase_partition(&part.name, &mut progress_callback) {
             pb.abandon("Format failed!");
-            return Err(e)?;
+            Err(e)?;
         }
 
         info!("Partition '{}' formatted.", part.name);

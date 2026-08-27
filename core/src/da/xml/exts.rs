@@ -1,38 +1,29 @@
 /*
     SPDX-License-Identifier: AGPL-3.0-or-later
-    SPDX-FileCopyrightText: 2025-2026 Shomy
+    SPDX-FileCopyrightText: 2026 Shomy
 */
-use std::io::{Cursor, Read, Write};
 
-use log::{debug, info};
+use acon::{MMIO, SoC};
+use hacc::DaEntry;
+use log::{debug, info, warn};
+use penumbra_macros::XmlCommand;
 use wincode::SchemaWrite;
-use xmlcmd_derive::XmlCommand;
 
-use crate::core::ToBytes;
-use crate::core::storage::{RPMB_FRAME_DATA_SZ, RpmbRegion, Storage, StorageType};
-use crate::da::DownloadProtocol;
+use crate::da::extensions::{KeyDeriveId, KeyDeriveParams, KeySize, SejParams};
 use crate::da::xml::Xml;
-use crate::da::xml::cmds::{XmlCmdLifetime, XmlCommand};
-use crate::da::xml::patch::to_arch;
-use crate::error::{Error, Result};
-use crate::exploit::get_v6_payload;
-use crate::utilities::analysis::{ArchAnalyzer, create_analyzer};
-use crate::utilities::patching::bytes_to_hex;
-use crate::utilities::xml::get_tag;
+use crate::da::xml::cmd::{XmlCmdLifetime, XmlCommand};
+use crate::da::{DownloadProtocol, NOOP_PROGRESS};
+use crate::error::{PenumbraError, ProtocolError, Result};
+use crate::exploit::{DaEntryExt, get_v6_payload};
+use crate::port::MtkPort;
+use crate::storage::{RPMB_FRAME_DATA_SZ, RpmbRegion, Storage};
+use crate::traits::{ProgressCallback, Reader, ToBytes, Writer};
+use crate::utils::analysis::{Aarch64Analyzer, Analyzer, Arch, ArchAnalyzer, ArmAnalyzer};
+use crate::utils::xml::{get_tag, get_tag_usize};
 
 const DA_EXT: &[u8] = include_bytes!("../../../payloads/da_xml.bin");
 const POINTER_TABLE_MAGIC: u32 = 0x54525450;
-
-#[derive(SchemaWrite, ToBytes)]
-#[repr(C)]
-struct ExtPointerTableLegacy {
-    magic: u32,
-    uart_base: u32,
-    reg_cmd: u32,
-    malloc: u32,
-    free: u32,
-    mmc_get_card: u32,
-}
+const MAX_RPMB_TRANSFER_SECTORS: u32 = u32::MAX / RPMB_FRAME_DATA_SZ as u32;
 
 #[derive(SchemaWrite, ToBytes)]
 #[repr(C)]
@@ -40,6 +31,8 @@ struct ExtPointerTable {
     magic: u32,
     uart_base: u32,
     reg_cmd: u32,
+    clear_err_msg: u32,
+    set_err_msg: u32,
     malloc: u32,
     free: u32,
     mmc_get_card: u32,
@@ -89,9 +82,29 @@ pub struct ExtWriteMem {
 }
 
 #[derive(XmlCommand)]
+pub struct ExtReadReg {
+    #[xml(tag = "address", fmt = "0x{address:X}")]
+    address: u64,
+}
+
+#[derive(XmlCommand)]
+pub struct ExtWriteReg {
+    #[xml(tag = "address", fmt = "0x{address:X}")]
+    address: u64,
+    #[xml(tag = "value", fmt = "0x{value:X}")]
+    value: u32,
+}
+
+#[derive(XmlCommand)]
 pub struct ExtKeyDerive {
     #[xml(tag = "key_type")]
-    key_type: String,
+    pub key_type: String,
+    #[xml(tag = "key_length", fmt = "0x{key_length:X}")]
+    pub key_length: u32,
+    #[xml(tag = "label")]
+    pub label: String,
+    #[xml(tag = "salt")]
+    pub salt: String,
 }
 
 #[derive(XmlCommand)]
@@ -102,6 +115,12 @@ pub struct ExtSej {
     anti_clone: String,
     #[xml(tag = "length", fmt = "0x{length:X}")]
     length: u32,
+    #[xml(tag = "cbc")]
+    cbc: String,
+    #[xml(tag = "key_id")]
+    key_id: String,
+    #[xml(tag = "key_size")]
+    key_size: String,
 }
 
 #[derive(XmlCommand)]
@@ -138,55 +157,15 @@ pub struct ExtRpmbInfo {
     partition: u32,
 }
 
-fn ack_extensions(xml: &mut Xml) -> Result<bool> {
-    if xmlcmd!(xml, ExtAck).is_err() {
-        debug!("Extensions did not reply to EXT-ACK");
+pub fn boot_extensions<P: MtkPort>(xml: &mut Xml, port: &mut P, da: &DaEntry<'_>) -> Result<bool> {
+    let Some(chip) = xml.get_devinfo().chip() else {
+        warn!("Failed to get chip info, continuing without extensions");
         return Ok(false);
-    }
-
-    let response = match xml.get_upload_file_resp() {
-        Ok(resp) => resp,
-        Err(_) => {
-            xml.lifetime_ack(XmlCmdLifetime::CmdEnd)?;
-            debug!("Failed to get extension ack response");
-            return Ok(false);
-        }
     };
 
-    xml.lifetime_ack(XmlCmdLifetime::CmdEnd)?;
-
-    let ack: String = get_tag(&response, "status")?;
-    if ack != "OK" {
-        debug!("DA extensions returned non-OK ack: {}", ack);
+    let Some(ext_data) = prepare_extensions(da, chip) else {
+        warn!("Failed to prepare XML extensions. Continuing without.");
         return Ok(false);
-    }
-
-    Ok(true)
-}
-
-fn configure_extensions(xml: &mut Xml) -> Result<()> {
-    let sej_base = xml.chip().sej_base();
-    let tzcc_base = xml.chip().tzcc_base();
-    let ssr_base = xml.chip().ssr_base();
-    let da2_base = xml.da.get_da2().map(|da2| da2.addr).unwrap_or(0);
-    let da2_size = xml.da.get_da2().map(|da2| da2.data.len() as u32).unwrap_or(0);
-    let storage = xml.get_storage().map_or("Unknown", |s| s.as_str());
-    let usb_log = if xml.usb_log_channel { "yes" } else { "no" };
-
-    xmlcmd_e!(xml, ExtDaCtx, sej_base, tzcc_base, ssr_base, da2_base, da2_size, storage, usb_log)?;
-
-    Ok(())
-}
-
-pub fn boot_extensions(xml: &mut Xml) -> Result<bool> {
-    let ext_data = match prepare_extensions(xml) {
-        Some(data) => data,
-        None => {
-            info!(
-                "Failed to prepare XML extensions. This DA may not expose the eMMC symbols required by the bundled extensions."
-            );
-            return Ok(false);
-        }
     };
 
     debug!("Trying booting XML extensions...");
@@ -194,70 +173,109 @@ pub fn boot_extensions(xml: &mut Xml) -> Result<bool> {
     let ext_addr = 0x68000000;
     let ext_size = DA_EXT.len() as u32;
 
-    info!("Uploading XML extensions to 0x{:08X} (0x{:X} bytes)", ext_addr, ext_size);
+    info!("Uploading XML DA extensions to 0x{:08X} (0x{:X} bytes)", ext_addr, ext_size);
 
-    let boot_to_resp = xml.boot_to(ext_addr, &ext_data).unwrap_or(false);
-    if !boot_to_resp {
-        info!("Failed to upload XML extensions, continuing without extensions");
+    if xml.boot_to(port, ext_addr, &ext_data).is_err() {
+        warn!("Failed to upload XML extensions, continuing without extensions");
         return Ok(false);
     }
 
-    if !ack_extensions(xml)? {
-        info!("Extensions did not reply, continuing without extensions");
+    if xmlcmd!(xml, port, ExtAck).is_err() {
+        warn!("Extensions did not reply, continuing without extensions");
         return Ok(false);
     }
 
-    configure_extensions(xml)?;
+    let response = xml.get_upload_file_resp(port);
+    xml.lifetime_ack(port, XmlCmdLifetime::CmdEnd)?;
+
+    if response.is_err() {
+        warn!("Failed to get extension ack response, continuing without extensions");
+        return Ok(false);
+    };
+
+    let ack: String = get_tag(&response?, "status")?;
+    if ack != "OK" {
+        warn!("DA extensions failed to start: {}", ack);
+        return Ok(false);
+    }
+
+    let sej_base = chip.hacc();
+    let tzcc_base = chip.tzcc().map(|n| n.get()).unwrap_or_default();
+    let ssr_base = chip.ssr().map(|n| n.get()).unwrap_or_default();
+    let da2_base = da.da2().addr();
+    let da2_size = da.da2().region_length() as u32;
+    let storage = xml.get_storage(port).map_or("Unknown", |s| s.as_str());
+    let usb_log = if xml.usb_log_channel { "yes" } else { "no" };
+
+    xmlcmd_e!(
+        xml, port, ExtDaCtx, sej_base, tzcc_base, ssr_base, da2_base, da2_size, storage, usb_log
+    )?;
 
     info!("Successfully booted XML extensions");
 
     Ok(true)
 }
 
-fn prepare_extensions(xml: &Xml) -> Option<Vec<u8>> {
-    let da2address = xml.da.get_da2()?.addr;
-    let da2data = &xml.da.get_da2()?.data;
+fn prepare_extensions(da: &DaEntry<'_>, chip: SoC) -> Option<Vec<u8>> {
+    let da2address = da.da2().addr() as u64;
+    let da2data = da.da2_code();
 
-    let is_arm64 = xml.da.is_arm64();
+    let analyzer = match da.arch() {
+        Arch::Aarch64 => Analyzer::Aarch64(Aarch64Analyzer::new(da2data.into(), da2address)),
+        Arch::Arm => Analyzer::Arm(ArmAnalyzer::new(da2data.into(), da2address)),
+        _ => unreachable!(),
+    };
+
+    let is_arm64 = matches!(da.arch(), Arch::Aarch64);
     let mut da_ext_data = get_v6_payload(DA_EXT, is_arm64).to_vec();
 
-    let analyzer = create_analyzer(da2data.clone(), da2address as u64, to_arch(is_arm64));
-
-    let off = analyzer.find_string_xref("CMD:REBOOT")?;
-    let bl_off = analyzer.get_next_bl_from_off(off)?;
-    let reg_cmd_addr = analyzer.get_bl_target(bl_off)? as u32;
+    let reg_cmd_addr = analyzer
+        .fn_from_str("CMD:REBOOT")
+        .and_then(|off| analyzer.next_bl_from_off(off))
+        .and_then(|off| analyzer.bl_target(off))? as u32;
 
     debug!("Reg CMD function at VA 0x{:X}", reg_cmd_addr);
 
-    let off = analyzer.va_to_offset(reg_cmd_addr as u64)?;
-    let bl_off = analyzer.get_next_bl_from_off(off)?;
-    let malloc_addr = analyzer.get_bl_target(bl_off)? as u32;
+    let malloc_addr = analyzer
+        .va_to_off(reg_cmd_addr as u64)
+        .and_then(|off| analyzer.next_bl_from_off(off))
+        .and_then(|off| analyzer.bl_target(off))? as u32;
 
     debug!("Malloc function at VA 0x{:X}", malloc_addr);
 
-    let off = analyzer.find_string_xref("Bad %s")?;
-    let bl1 = analyzer.get_next_bl_from_off(off)?;
-    let bl2 = analyzer.get_next_bl_from_off(bl1 + 4)?;
-    let free_addr = analyzer.get_bl_target(bl2)? as u32;
+    let free_addr = analyzer
+        .str_xref("Bad %s")
+        .and_then(|off| analyzer.next_bl_from_off(off))
+        .and_then(|bl_off| analyzer.next_bl_from_off(bl_off + 4))
+        .and_then(|bl_off| analyzer.bl_target(bl_off))? as u32;
 
     debug!("Free function at VA 0x{:X}", free_addr);
 
+    // On newer devices, MMC is not compiled at all.
     let mmc_get_card = analyzer
-        .find_function_from_string("mmc_switch_part")
-        .and_then(|off| analyzer.get_next_bl_from_off(off))
-        .and_then(|bl_off| analyzer.get_bl_target(bl_off))
-        .map_or(0, |addr| addr as u32);
+        .fn_from_str("mmc_switch_part")
+        .and_then(|off| analyzer.next_bl_from_off(off))
+        .and_then(|bl_off| analyzer.bl_target(bl_off))
+        .unwrap_or(0) as u32;
 
-    if mmc_get_card == 0 {
-        debug!("Could not locate mmc_get_card function, continuing with a null MMC pointer");
-    } else {
-        debug!("mmc_get_card function at VA 0x{:X}", mmc_get_card);
-    }
+    debug!("mmc_get_card function at VA 0x{:X}", mmc_get_card);
+
+    let unsup_cmd = analyzer.str_xref("Unsupported command.")?;
+
+    let set_err_msg =
+        analyzer.next_bl_from_off(unsup_cmd).and_then(|off| analyzer.bl_target(off))? as u32;
+
+    debug!("set_err_msg function at VA 0x{:X}", set_err_msg);
+
+    let clear_err_msg =
+        analyzer.next_bl_from_off(unsup_cmd - 0x10).and_then(|off| analyzer.bl_target(off))? as u32;
+
+    debug!("clear_err_msg function at VA 0x{:X}", clear_err_msg);
 
     let (ufs_get_lu, ufs_get_tag, ufs_queuecommand, ufs_put_tag) = if is_arm64 {
         (0, 0, 0, 0)
     } else {
-        find_ufs_rpmb_helpers(analyzer.as_ref()).unwrap_or((0, 0, 0, 0))
+        find_ufs_rpmb_helpers(&analyzer).unwrap_or((0, 0, 0, 0))
     };
 
     if ufs_get_lu != 0 && ufs_get_tag != 0 && ufs_queuecommand != 0 && ufs_put_tag != 0 {
@@ -269,92 +287,70 @@ fn prepare_extensions(xml: &Xml) -> Option<Vec<u8>> {
         debug!("Could not locate UFS RPMB helper functions");
     }
 
-    let da_key_derive = if is_arm64 {
-        0
-    } else {
-        find_native_da_key_derive(analyzer.as_ref()).unwrap_or(0)
-    };
-
+    let da_key_derive =
+        if is_arm64 { 0 } else { find_native_da_key_derive(&analyzer).unwrap_or(0) };
     if da_key_derive != 0 {
         info!("Using native DA key derivation helper at 0x{da_key_derive:08X}");
     } else {
         debug!("Could not locate native DA key derivation helper");
     }
 
-    let ufs_read_desc = if is_arm64 {
-        0
-    } else {
-        find_ufs_read_desc(analyzer.as_ref()).unwrap_or(0)
-    };
-
+    let ufs_read_desc = if is_arm64 { 0 } else { find_ufs_read_desc(&analyzer).unwrap_or(0) };
     if ufs_read_desc != 0 {
         info!("Using native UFS descriptor reader at 0x{ufs_read_desc:08X}");
     } else {
         debug!("Could not locate native UFS descriptor query helper");
     }
 
-    let uart_base = xml.chip().uart();
+    let uart_base = chip.uart0();
 
     debug!("UART base address at 0x{:X}", uart_base);
 
-    if is_arm64 {
-        // The bundled ARM64 payload still uses the original six-field table.
-        // Keep its ABI intact instead of overwriting the preceding payload data.
-        let table = ExtPointerTableLegacy {
-            magic: POINTER_TABLE_MAGIC,
-            uart_base,
-            reg_cmd: reg_cmd_addr,
-            malloc: malloc_addr,
-            free: free_addr,
-            mmc_get_card,
-        };
-        let off = da_ext_data.len().checked_sub(ExtPointerTableLegacy::SIZE)?;
-        da_ext_data[off..off + ExtPointerTableLegacy::SIZE].copy_from_slice(&table.to_bytes());
-    } else {
-        let table = ExtPointerTable {
-            magic: POINTER_TABLE_MAGIC,
-            uart_base,
-            reg_cmd: reg_cmd_addr,
-            malloc: malloc_addr,
-            free: free_addr,
-            mmc_get_card,
-            ufs_get_lu,
-            ufs_get_tag,
-            ufs_queuecommand,
-            ufs_put_tag,
-            da_key_derive,
-            ufs_read_desc,
-        };
-        let off = da_ext_data.len().checked_sub(ExtPointerTable::SIZE)?;
-        da_ext_data[off..off + ExtPointerTable::SIZE].copy_from_slice(&table.to_bytes());
-    }
+    let table = ExtPointerTable {
+        magic: POINTER_TABLE_MAGIC,
+        uart_base,
+        reg_cmd: reg_cmd_addr,
+        clear_err_msg,
+        set_err_msg,
+        malloc: malloc_addr,
+        free: free_addr,
+        mmc_get_card,
+        ufs_get_lu,
+        ufs_get_tag,
+        ufs_queuecommand,
+        ufs_put_tag,
+        da_key_derive,
+        ufs_read_desc,
+    };
+
+    let off = da_ext_data.len() - ExtPointerTable::SIZE;
+
+    da_ext_data[off..off + ExtPointerTable::SIZE].copy_from_slice(&table.to_bytes());
 
     Some(da_ext_data)
 }
 
-fn find_ufs_rpmb_helpers(analyzer: &dyn ArchAnalyzer) -> Option<(u32, u32, u32, u32)> {
-    let read_counter_off = analyzer.find_function_from_string("rpmb_authen_read_counter")?;
+fn find_ufs_rpmb_helpers(analyzer: &Analyzer) -> Option<(u32, u32, u32, u32)> {
+    let read_counter_off = analyzer.fn_from_str("rpmb_authen_read_counter")?;
 
-    let get_lu_bl = analyzer.get_next_bl_from_off(read_counter_off)?;
-    let ufs_get_lu = analyzer.get_bl_target(get_lu_bl)? as u32;
+    let get_lu_bl = analyzer.next_bl_from_off(read_counter_off)?;
+    let ufs_get_lu = analyzer.bl_target(get_lu_bl)? as u32;
 
-    let get_tag_bl = analyzer.get_next_bl_from_off(get_lu_bl + 4)?;
-    let ufs_get_tag = analyzer.get_bl_target(get_tag_bl)? as u32;
+    let get_tag_bl = analyzer.next_bl_from_off(get_lu_bl + 4)?;
+    let ufs_get_tag = analyzer.bl_target(get_tag_bl)? as u32;
 
-    // Oplus/MTK ARM32 DA layout observed around rpmb_authen_read_counter:
-    // +0x150: first ufshcd_queuecommand call, +0x2D4: tag release helper.
-    let ufs_queuecommand = analyzer.get_bl_target(read_counter_off + 0x150)? as u32;
-    let ufs_put_tag = analyzer.get_bl_target(read_counter_off + 0x2D4)? as u32;
+    // ARM32 layout observed in MT6895-family DAs.
+    let ufs_queuecommand = analyzer.bl_target(read_counter_off + 0x150)? as u32;
+    let ufs_put_tag = analyzer.bl_target(read_counter_off + 0x2D4)? as u32;
 
     Some((ufs_get_lu, ufs_get_tag, ufs_queuecommand, ufs_put_tag))
 }
 
-fn find_native_da_key_derive(analyzer: &dyn ArchAnalyzer) -> Option<u32> {
-    let offset = analyzer.find_function_from_string("key_derive fails")?;
+fn find_native_da_key_derive(analyzer: &Analyzer) -> Option<u32> {
+    let offset = analyzer.fn_from_str("key_derive fails")?;
 
-    // Guard the dynamic string-based match with the ARM32 prologue used by
-    // the three-argument native wrapper in the rubens/MT6895 DA. Calling an
-    // unrelated function as a key helper would be unsafe.
+    // Guard the string match with the ARM32 prologue used by the native
+    // three-argument wrapper in the MT6895 DA.
     let expected = [0xE92D_48F0, 0xE28D_B010, 0xE24D_D030];
     for (index, instruction) in expected.into_iter().enumerate() {
         if analyzer.read_u32(offset + index * 4)? != instruction {
@@ -362,7 +358,7 @@ fn find_native_da_key_derive(analyzer: &dyn ArchAnalyzer) -> Option<u32> {
         }
     }
 
-    let address = analyzer.offset_to_va(offset)?;
+    let address = analyzer.off_to_va(offset)?;
     if address > u32::MAX as u64 || address & 3 != 0 {
         return None;
     }
@@ -370,13 +366,10 @@ fn find_native_da_key_derive(analyzer: &dyn ArchAnalyzer) -> Option<u32> {
     Some(address as u32)
 }
 
-fn find_ufs_read_desc(analyzer: &dyn ArchAnalyzer) -> Option<u32> {
-    let offset = analyzer.find_function_from_string(
-        "[UFS] failed reading descriptor. desc_id %d desc_len %d ret %d",
-    )?;
+fn find_ufs_read_desc(analyzer: &Analyzer) -> Option<u32> {
+    let offset =
+        analyzer.fn_from_str("[UFS] failed reading descriptor. desc_id %d desc_len %d ret %d")?;
 
-    // MT6895 checked descriptor reader. ABI:
-    // int fn(ufs, desc_id, index, selector, buffer, length).
     let expected = [0xE92D_48F0, 0xE28D_B010, 0xE24D_D010, 0xE1A0_4001];
     for (index, instruction) in expected.into_iter().enumerate() {
         if analyzer.read_u32(offset + index * 4)? != instruction {
@@ -384,260 +377,326 @@ fn find_ufs_read_desc(analyzer: &dyn ArchAnalyzer) -> Option<u32> {
         }
     }
 
-    let address = analyzer.offset_to_va(offset)?;
+    let address = analyzer.off_to_va(offset)?;
     if address > u32::MAX as u64 || address & 3 != 0 {
         return None;
     }
+
     Some(address as u32)
 }
 
-pub fn peek<W, F>(xml: &mut Xml, addr: u32, length: usize, writer: W, progress: F) -> Result<()>
-where
-    W: Write,
-    F: FnMut(usize, usize) + Send,
-{
-    xmlcmd!(xml, ExtReadMem, addr, length)?;
+pub(super) fn peek<W: Writer, F: ProgressCallback, P: MtkPort>(
+    xml: &mut Xml,
+    port: &mut P,
+    addr: u64,
+    length: usize,
+    writer: W,
+    progress: F,
+) -> Result<()> {
+    xmlcmd!(xml, port, ExtReadMem, addr as u32, length)?;
 
-    xml.upload_file(writer, progress)?;
+    xml.upload_data(port, length, writer, progress)?;
 
-    xml.lifetime_ack(XmlCmdLifetime::CmdEnd)?;
-
-    Ok(())
+    xml.lifetime_ack(port, XmlCmdLifetime::CmdEnd)
 }
 
-pub fn poke<R, F>(xml: &mut Xml, addr: u32, length: usize, reader: R, progress: F) -> Result<()>
-where
-    R: Read,
-    F: FnMut(usize, usize) + Send,
-{
-    xmlcmd!(xml, ExtWriteMem, addr, length)?;
+pub(super) fn poke<R: Reader, F: ProgressCallback, P: MtkPort>(
+    xml: &mut Xml,
+    port: &mut P,
+    addr: u64,
+    length: usize,
+    reader: R,
+    progress: F,
+) -> Result<()> {
+    xmlcmd!(xml, port, ExtWriteMem, addr as u32, length)?;
 
-    xml.download_file(length, reader, progress)?;
+    xml.download_data(port, length, reader, progress)?;
 
-    xml.lifetime_ack(XmlCmdLifetime::CmdEnd)?;
-
-    Ok(())
+    xml.lifetime_ack(port, XmlCmdLifetime::CmdEnd)
 }
 
-pub fn sej(xml: &mut Xml, data: &[u8], encrypt: bool, anti_clone: bool) -> Result<Vec<u8>> {
-    let length = data.len() as u32;
+pub(super) fn read_register<P: MtkPort>(xml: &mut Xml, port: &mut P, addr: u64) -> Result<u32> {
+    xmlcmd!(xml, port, ExtReadReg, addr)?;
 
-    let encrypt_str = if encrypt { "yes" } else { "no" };
-    let anti_clone_str = if anti_clone { "yes" } else { "no" };
-    xmlcmd!(xml, ExtSej, encrypt_str, anti_clone_str, length)?;
+    let response = xml.get_upload_file_resp(port);
+    xml.lifetime_ack(port, XmlCmdLifetime::CmdEnd)?;
 
-    let mut buf = data.to_vec();
-    let mut cursor = Cursor::new(&mut buf);
-    let progress = |_: usize, _: usize| {};
+    let resp = response?;
 
-    xml.download_file(length as usize, &mut cursor, progress)?;
-    cursor.set_position(0);
-    xml.upload_file(&mut cursor, progress)?;
+    let value: u32 = get_tag_usize(&resp, "value")? as u32;
 
-    xml.lifetime_ack(XmlCmdLifetime::CmdEnd)?;
-
-    Ok(buf)
+    Ok(value)
 }
 
-fn ensure_rpmb_extensions(xml: &mut Xml) -> Result<()> {
-    if xml.using_exts {
-        return Ok(());
-    }
-
-    info!("XML DA extensions are not marked as loaded; probing existing extension state");
-    if ack_extensions(xml)? {
-        configure_extensions(xml)?;
-        xml.using_exts = true;
-        info!("Reattached to already-loaded XML extensions");
-        return Ok(());
-    }
-
-    info!("Existing XML extensions did not respond; attempting to boot extensions now");
-    xml.boot_extensions()?;
-    if xml.using_exts {
-        return Ok(());
-    }
-
-    let storage = xml.get_storage().map_or("Unknown", |s| s.as_str());
-    Err(Error::penumbra(format!(
-        "XML DA extensions are not loaded; RPMB commands are unavailable for storage type {storage}."
-    )))
+pub(super) fn write_register<P: MtkPort>(
+    xml: &mut Xml,
+    port: &mut P,
+    addr: u64,
+    value: u32,
+) -> Result<()> {
+    xmlcmd_e!(xml, port, ExtWriteReg, addr, value)
 }
 
-fn init_rpmb(xml: &mut Xml, region: RpmbRegion) -> Result<()> {
-    ensure_rpmb_extensions(xml)?;
+pub(super) fn derive_key<P: MtkPort>(
+    xml: &mut Xml,
+    port: &mut P,
+    params: KeyDeriveParams,
+) -> Result<Vec<u8>> {
+    const MAX_DATA_LEN: usize = 0x20;
 
-    // Derive RPMB key (0 = RPMB)
-    xmlcmd!(xml, ExtKeyDerive, "RPMB")?;
-    let resp = xml.get_upload_file_resp()?;
+    let (key_type, key_length, label, salt) = match params {
+        KeyDeriveParams::Id { id, len } => {
+            (id.to_string(), len.to_bytes() as u32, String::new(), String::new())
+        }
+        KeyDeriveParams::Input { label, salt, len } => {
+            if label.len() > MAX_DATA_LEN || salt.len() > MAX_DATA_LEN {
+                return Err(PenumbraError::InvalidKeySourceLength.into());
+            }
 
-    if let Ok(status) = get_tag::<String>(&resp, "status")
-        && status != "OK"
-    {
-        let error = get_tag::<String>(&resp, "error").unwrap_or_else(|_| "unknown".to_string());
-        xml.lifetime_ack(XmlCmdLifetime::CmdEnd)?;
-        return Err(Error::penumbra(format!("RPMB key derivation failed: {error}")));
-    }
+            (
+                KeyDeriveId::Input.to_string(),
+                len.to_bytes() as u32,
+                hex::encode(label),
+                hex::encode(salt),
+            )
+        }
+    };
 
-    let key: String = get_tag(&resp, "result")?;
-    xml.lifetime_ack(XmlCmdLifetime::CmdEnd)?;
+    xmlcmd!(xml, port, ExtKeyDerive, key_type, key_length, label, salt)?;
 
-    if key.len() != 64 || !key.as_bytes().iter().all(|b| b.is_ascii_hexdigit()) {
-        return Err(Error::penumbra(format!(
-            "RPMB key derivation returned an invalid key ({} hex chars)",
-            key.len()
-        )));
-    }
+    let response = xml.get_upload_file_resp(port);
+    xml.lifetime_ack(port, XmlCmdLifetime::CmdEnd)?;
 
-    // The extension installs the key and authenticates it against the RPMB
-    // write-counter response before allowing a write.
-    xmlcmd_e!(xml, ExtRpmbInit, region as u32, key)?;
+    let resp = response?;
+
+    let key_hex: String = get_tag(&resp, "result")?;
+
+    let key = hex::decode(&key_hex).map_err(|_| ProtocolError::InvalidResponseFormat)?;
+
+    Ok(key)
+}
+
+pub(super) fn sej_aes<R: Reader, W: Writer, P: MtkPort>(
+    xml: &mut Xml,
+    port: &mut P,
+    params: &SejParams,
+    reader: R,
+    writer: W,
+) -> Result<()> {
+    let encrypt_str = if params.encrypt { "yes" } else { "no" };
+    let ac_str = if params.anti_clone { "yes" } else { "no" };
+    let cbc_str = if params.cbc { "yes" } else { "no" };
+
+    xmlcmd!(
+        xml,
+        port,
+        ExtSej,
+        encrypt_str,
+        ac_str,
+        params.length,
+        cbc_str,
+        params.key_id.to_string(),
+        params.key_sz.to_string()
+    )?;
+
+    xml.download_data(port, params.length as usize, reader, NOOP_PROGRESS)?;
+    xml.upload_data(port, params.length as usize, writer, NOOP_PROGRESS)?;
+
+    xml.lifetime_ack(port, XmlCmdLifetime::CmdEnd)
+}
+
+fn init_rpmb<P: MtkPort>(xml: &mut Xml, port: &mut P, region: RpmbRegion) -> Result<()> {
+    let key =
+        derive_key(xml, port, KeyDeriveParams::Id { id: KeyDeriveId::Rpmb, len: KeySize::Key256 })?;
+
+    // If the RPMB is already initialized (even with another key), this will succeed
+    // without actually changing the key.
+    xmlcmd_e!(xml, port, ExtRpmbInit, region as u32, hex::encode(&key))?;
     xml.rpmb_authenticated_regions |= 1 << (region as u8);
-
     Ok(())
 }
 
-pub fn verify_derived_rpmb_key(xml: &mut Xml, region: RpmbRegion) -> Result<()> {
-    init_rpmb(xml, region)
+fn storage_sector_count(rpmb_size: u64) -> Result<Option<u32>> {
+    if rpmb_size == 0 {
+        return Ok(None);
+    }
+
+    let sectors = u32::try_from(rpmb_size / RPMB_FRAME_DATA_SZ as u64)
+        .map_err(|_| PenumbraError::RpmbSectorOutOfBounds)?;
+    Ok(Some(sectors))
 }
 
-pub fn get_rpmb_sector_count(xml: &mut Xml, region: RpmbRegion) -> Result<u32> {
-    get_rpmb_region_info(xml, region).map(|(_, sectors)| sectors)
+fn checked_rpmb_data_len(
+    start_sector: u32,
+    num_sectors: u32,
+    max_sectors: Option<u32>,
+) -> Result<usize> {
+    if num_sectors == 0 || num_sectors > MAX_RPMB_TRANSFER_SECTORS {
+        return Err(PenumbraError::RpmbSectorOutOfBounds.into());
+    }
+
+    let end = start_sector.checked_add(num_sectors).ok_or(PenumbraError::RpmbSectorOutOfBounds)?;
+    if max_sectors.is_some_and(|max| end > max) {
+        return Err(PenumbraError::RpmbSectorOutOfBounds.into());
+    }
+
+    (num_sectors as usize)
+        .checked_mul(RPMB_FRAME_DATA_SZ)
+        .ok_or_else(|| PenumbraError::RpmbSectorOutOfBounds.into())
 }
 
-pub fn get_rpmb_region_info(xml: &mut Xml, region: RpmbRegion) -> Result<(bool, u32)> {
-    ensure_rpmb_extensions(xml)?;
+fn rpmb_max_sectors<P: MtkPort>(
+    xml: &mut Xml,
+    port: &mut P,
+    region: RpmbRegion,
+    storage_type: crate::storage::StorageType,
+    global_rpmb_size: u64,
+) -> Result<Option<u32>> {
+    let global = storage_sector_count(global_rpmb_size)?;
+    if storage_type != crate::storage::StorageType::Ufs {
+        return Ok(global);
+    }
 
-    xmlcmd!(xml, ExtRpmbInfo, region as u32)?;
-    let response = xml.get_upload_file_resp()?;
-    xml.lifetime_ack(XmlCmdLifetime::CmdEnd)?;
+    match get_rpmb_region_info(xml, port, region) {
+        Ok((_, sectors)) if sectors != 0 => Ok(Some(sectors)),
+        Ok(_) if region == RpmbRegion::R0 => Ok(global),
+        Ok(_) => Ok(Some(0)),
+        Err(error) => {
+            warn!("Failed to retrieve RPMB region {} capacity: {error}", region as u32);
+            if region == RpmbRegion::R0 { Ok(global) } else { Err(error) }
+        }
+    }
+}
 
+pub(super) fn get_rpmb_region_info<P: MtkPort>(
+    xml: &mut Xml,
+    port: &mut P,
+    region: RpmbRegion,
+) -> Result<(bool, u32)> {
+    let Some(storage) = xml.get_storage(port) else {
+        return Err(ProtocolError::CannotGetStorageInfo.into());
+    };
+    let storage_type = storage.kind();
+    let rpmb_size = storage.get_rpmb_size();
+
+    if storage_type != crate::storage::StorageType::Ufs {
+        if region != RpmbRegion::R0 {
+            return Ok((false, 0));
+        }
+
+        let sectors = storage_sector_count(rpmb_size)?.unwrap_or(0);
+        return Ok((sectors != 0, sectors));
+    }
+
+    xmlcmd!(xml, port, ExtRpmbInfo, region as u32)?;
+    let response = xml.get_upload_file_resp(port);
+    xml.lifetime_ack(port, XmlCmdLifetime::CmdEnd)?;
+
+    let response = response?;
     let enabled = get_tag::<String>(&response, "enabled")? == "yes";
     let sectors = get_tag::<u32>(&response, "sector_count")?;
     Ok((enabled, sectors))
 }
 
-pub fn read_rpmb<W, F>(
+pub(super) fn read_rpmb<W: Writer, F: ProgressCallback, P: MtkPort>(
     xml: &mut Xml,
+    port: &mut P,
     region: RpmbRegion,
     start_sector: u32,
-    sectors_count: u32,
+    num_sectors: u32,
     writer: W,
     progress: F,
-) -> Result<()>
-where
-    W: Write + Send,
-    F: FnMut(usize, usize) + Send,
-{
-    let storage = match xml.get_storage() {
-        Some(s) => s,
-        None => {
-            return Err(Error::penumbra("Failed to get storage information for RPMB read"));
-        }
+) -> Result<()> {
+    let Some(storage) = xml.get_storage(port) else {
+        return Err(ProtocolError::CannotGetStorageInfo.into());
     };
 
-    if storage.kind() == StorageType::Ufs {
-        ensure_rpmb_extensions(xml)?;
-        info!("Skipping RPMB key derivation/init for UFS RPMB read");
-    } else {
-        init_rpmb(xml, region)?;
-    }
-
-    if sectors_count == 0 {
-        return Err(Error::penumbra("RPMB sector count must be greater than 0"));
-    }
-
+    let storage_type = storage.kind();
     let rpmb_size = storage.get_rpmb_size();
-    if rpmb_size != 0 {
-        let max_sectors = (rpmb_size / RPMB_FRAME_DATA_SZ as u64) as u32;
-        if start_sector.checked_add(sectors_count).is_none_or(|end| end > max_sectors) {
-            return Err(Error::penumbra("Requested RPMB read range is out of bounds"));
-        }
+    if storage_type == crate::storage::StorageType::Ufs {
+        info!("Skipping RPMB key derivation/init for UFS RPMB read");
+    } else if xml.rpmb_authenticated_regions & (1 << (region as u8)) != 0 {
+        info!("Using the already authenticated RPMB key for RPMB read");
     } else {
+        init_rpmb(xml, port, region)?;
+    }
+
+    let max_sectors = rpmb_max_sectors(xml, port, region, storage_type, rpmb_size)?;
+    let data_len = checked_rpmb_data_len(start_sector, num_sectors, max_sectors)?;
+    if max_sectors.is_none() {
         info!("Device reports unknown RPMB size; skipping RPMB bounds check");
     }
 
-    xmlcmd!(xml, ExtRpmbRead, region as u32, start_sector, sectors_count)?;
-    if let Err(error) = xml.upload_file(writer, progress) {
-        // A stream callback error is sent as ERR\0 before the command handler
-        // returns. Consume CMD:END as well so the next command stays in sync.
-        let _ = xml.lifetime_ack(XmlCmdLifetime::CmdEnd);
+    xmlcmd!(xml, port, ExtRpmbRead, region as u32, start_sector, num_sectors)?;
+    if let Err(error) = xml.upload_data(port, data_len, writer, progress) {
+        let _ = xml.lifetime_ack(port, XmlCmdLifetime::CmdEnd);
         return Err(error);
     }
-    xml.lifetime_ack(XmlCmdLifetime::CmdEnd)?;
-
-    Ok(())
+    xml.lifetime_ack(port, XmlCmdLifetime::CmdEnd)
 }
 
-pub fn write_rpmb<R, F>(
+pub(super) fn write_rpmb<R: Reader, F: ProgressCallback, P: MtkPort>(
     xml: &mut Xml,
+    port: &mut P,
     region: RpmbRegion,
     start_sector: u32,
-    sectors_count: u32,
+    num_sectors: u32,
     reader: R,
     progress: F,
-) -> Result<()>
-where
-    R: Read + Send,
-    F: FnMut(usize, usize) + Send,
-{
-    let storage = match xml.get_storage() {
-        Some(s) => s,
-        None => {
-            return Err(Error::penumbra("Failed to get storage information for RPMB write"));
-        }
+) -> Result<()> {
+    let Some(storage) = xml.get_storage(port) else {
+        return Err(ProtocolError::CannotGetStorageInfo.into());
     };
 
-    if storage.kind() == StorageType::Ufs {
-        if xml.rpmb_authenticated_regions & (1 << (region as u8)) != 0 {
-            ensure_rpmb_extensions(xml)?;
-            info!("Using provided RPMB key for UFS RPMB write");
-        } else {
-            info!("No RPMB key was provided; attempting device-side UFS RPMB key derivation");
-            init_rpmb(xml, region)?;
-        }
-    } else {
-        init_rpmb(xml, region)?;
-    }
-
-    if sectors_count == 0 {
-        return Err(Error::penumbra("RPMB sector count must be greater than 0"));
-    }
-
+    let storage_type = storage.kind();
     let rpmb_size = storage.get_rpmb_size();
-    if rpmb_size != 0 {
-        let max_sectors = (rpmb_size / RPMB_FRAME_DATA_SZ as u64) as u32;
-        if start_sector.checked_add(sectors_count).is_none_or(|end| end > max_sectors) {
-            return Err(Error::penumbra("Requested RPMB write range is out of bounds"));
-        }
+    if xml.rpmb_authenticated_regions & (1 << (region as u8)) != 0 {
+        info!("Using the already authenticated RPMB key for RPMB write");
     } else {
+        init_rpmb(xml, port, region)?;
+    }
+
+    let max_sectors = rpmb_max_sectors(xml, port, region, storage_type, rpmb_size)?;
+    let data_len = checked_rpmb_data_len(start_sector, num_sectors, max_sectors)?;
+    if max_sectors.is_none() {
         info!("Device reports unknown RPMB size; skipping RPMB bounds check");
     }
 
-    let data_len = sectors_count as usize * RPMB_FRAME_DATA_SZ;
-
-    xmlcmd!(xml, ExtRpmbWrite, region as u32, start_sector, sectors_count)?;
-    if let Err(error) = xml.download_file(data_len, reader, progress) {
-        // See the read path above: preserve the useful stream error while
-        // draining the command lifetime packet.
-        let _ = xml.lifetime_ack(XmlCmdLifetime::CmdEnd);
+    xmlcmd!(xml, port, ExtRpmbWrite, region as u32, start_sector, num_sectors)?;
+    if let Err(error) = xml.download_data(port, data_len, reader, progress) {
+        let _ = xml.lifetime_ack(port, XmlCmdLifetime::CmdEnd);
         return Err(error);
     }
-    xml.lifetime_ack(XmlCmdLifetime::CmdEnd)?;
-
-    Ok(())
+    xml.lifetime_ack(port, XmlCmdLifetime::CmdEnd)
 }
 
-pub fn auth_rpmb(xml: &mut Xml, region: RpmbRegion, key: &[u8]) -> Result<()> {
-    ensure_rpmb_extensions(xml)?;
+pub(super) fn erase_rpmb<F: ProgressCallback, P: MtkPort>(
+    xml: &mut Xml,
+    port: &mut P,
+    region: RpmbRegion,
+    start_sector: u32,
+    num_sectors: u32,
+    progress: F,
+) -> Result<()> {
+    let total_bytes = num_sectors as u64 * RPMB_FRAME_DATA_SZ as u64;
 
+    let zero_reader = std::io::repeat(0).take(total_bytes);
+
+    write_rpmb(xml, port, region, start_sector, num_sectors, zero_reader, progress)
+}
+
+pub(super) fn auth_rpmb<P: MtkPort>(
+    xml: &mut Xml,
+    port: &mut P,
+    region: RpmbRegion,
+    key: &[u8],
+) -> Result<()> {
     if key.len() != 32 {
-        return Err(Error::penumbra("RPMB key must be exactly 32 bytes"));
+        return Err(PenumbraError::InvalidRpmbKeyLength.into());
     }
 
-    let key = bytes_to_hex(key);
-    xmlcmd_e!(xml, ExtRpmbInit, region as u32, key)?;
+    let key_hex = hex::encode(key);
+    xmlcmd_e!(xml, port, ExtRpmbInit, region as u32, key_hex)?;
     xml.rpmb_authenticated_regions |= 1 << (region as u8);
-
     Ok(())
 }

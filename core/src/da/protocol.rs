@@ -2,44 +2,32 @@
     SPDX-License-Identifier: AGPL-3.0-or-later
     SPDX-FileCopyrightText: 2025-2026 Shomy
 */
-use std::io::{Read, Write};
+use std::time::Duration;
 
 use enum_dispatch::enum_dispatch;
+use hacc::{DaEntry, Preloader};
+use penumbra_macros::ToBytes;
 use wincode::{Deserialize, SchemaRead, SchemaWrite};
 
-use crate::DeviceLog;
-use crate::connection::Connection;
-use crate::connection::port::ConnectionType;
-use crate::core::chip::ChipInfo;
-use crate::core::devinfo::DeviceInfo;
-use crate::core::seccfg::LockFlag;
-use crate::core::storage::{Partition, PartitionKind, RpmbRegion, StorageKind, StorageType};
-use crate::core::{FromBytes, ToBytes};
-use crate::da::{DA, DAEntryRegion, XFlash, Xml};
-use crate::error::Result;
+use crate::activity::DeviceActivity;
+use crate::da::{DaLogLevel, XFlash, Xml};
+use crate::devinfo::DevInfo;
+use crate::log_buffer::DeviceLog;
+use crate::port::MtkPort;
+#[cfg(feature = "exploits")]
+use crate::storage::RpmbRegion;
+use crate::storage::{PartitionKind, Partitions, StorageKind, StorageType};
+use crate::traits::{FromBytes, ProgressCallback, Reader, ReaderSource, Writer, WriterSink};
+use crate::{BootMode, Partition, Result};
 
 /// MAGIC value for V5/V6 packets.
 pub const MAGIC: u32 = 0xFEEEEEEF;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BootMode {
-    Normal,
-    HomeScreen,
-    Fastboot,
-    Test,
-    Meta,
-}
-
-impl BootMode {
-    pub const fn to_text(&self) -> Option<&'static str> {
-        match self {
-            Self::Fastboot => Some("FASTBOOT"),
-            Self::Meta => Some("META"),
-            Self::Test => Some("ANDROID-TEST-MODE"),
-            Self::Normal | Self::HomeScreen => None,
-        }
-    }
-}
+/// Bad design choices require bad workarounds.
+pub const NOOP_PROGRESS: fn(usize, usize) = |_, _| {};
+// On some devices, the DA will hang while writing a sparse image (or just lag generally a lot),
+// even with the generous timeout of 10s. To account for this, a longer timeout can help the
+// unnecessary failures.
+pub const SPARSE_TIMEOUT: Duration = Duration::from_mins(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, SchemaRead, SchemaWrite)]
 #[repr(u32)]
@@ -50,12 +38,12 @@ pub enum DataType {
     Message = 0x2,
 }
 
-impl DataType {
-    pub const fn from_u32(v: u32) -> Option<Self> {
+impl From<u32> for DataType {
+    fn from(v: u32) -> Self {
         match v {
-            0x1 => Some(Self::Flow),
-            0x2 => Some(Self::Message),
-            _ => None,
+            0x1 => Self::Flow,
+            0x2 => Self::Message,
+            _ => Self::Flow,
         }
     }
 }
@@ -82,21 +70,12 @@ pub struct PacketHeader {
 impl PacketHeader {
     pub const SIZE: usize = size_of::<Self>();
 
-    pub const fn new(length: u32) -> Self {
-        Self { magic: MAGIC, data_type: DataType::Flow, length }
+    pub const fn new(data_type: DataType, length: u32) -> Self {
+        Self { magic: MAGIC, data_type, length }
     }
 
-    pub fn from_bytes(raw: &[u8]) -> Option<Self> {
-        if raw.len() < Self::SIZE {
-            return None;
-        }
-
-        let hdr = Self::deserialize(raw).ok()?;
-        if hdr.magic != MAGIC {
-            return None;
-        }
-
-        Some(hdr)
+    pub const fn flow(length: u32) -> Self {
+        Self::new(DataType::Flow, length)
     }
 }
 
@@ -104,7 +83,11 @@ impl FromBytes for PacketHeader {
     const SIZE: usize = size_of::<Self>();
 
     fn from_bytes(raw: &[u8]) -> Option<Self> {
-        let hdr = Self::from_bytes(raw)?;
+        if raw.len() < Self::SIZE {
+            return None;
+        }
+
+        let hdr = Self::deserialize(raw).ok()?;
 
         if hdr.magic != MAGIC {
             return None;
@@ -114,179 +97,299 @@ impl FromBytes for PacketHeader {
     }
 }
 
-pub struct DAProtocolParams {
-    pub da: DA,
-    pub devinfo: DeviceInfo,
+#[non_exhaustive]
+pub struct DaProtocolParams<'a> {
+    pub devinfo: DevInfo,
     pub device_log: DeviceLog,
-    pub verbose: bool,
+    pub activity: DeviceActivity,
+    pub log_level: DaLogLevel,
     pub usb_log_channel: bool,
-    pub force_heapb8: bool,
-    pub preloader: Option<Vec<u8>>, // TODO: Switch to Preloader type
+    pub force_heapbait: bool,
+    pub preloader: Option<Preloader<'a>>,
 }
 
 #[enum_dispatch(DownloadProtocol)]
-pub enum DAProtocol {
-    V5(XFlash),
+#[enum_dispatch(DownloadProtocolExt)]
+pub enum DaProtocol<'a> {
+    V5(XFlash<'a>),
     V6(Xml),
 }
 
 #[enum_dispatch]
 pub trait DownloadProtocol {
-    // Main helpers
-    fn upload_da(&mut self) -> Result<bool>;
-    fn boot_to(&mut self, addr: u32, data: &[u8]) -> Result<bool>;
-    fn send(&mut self, data: &[u8]) -> Result<bool>;
-    fn send_data(&mut self, data: &[&[u8]]) -> Result<bool>;
-    fn get_status(&mut self) -> Result<u32>;
-    fn shutdown(&mut self) -> Result<()>;
-    fn reboot(&mut self, bootmode: BootMode) -> Result<()>;
-    // FLASH operations
-    // fn read_partition(&mut self, name: &str) -> Result<Vec<u8>, Error>;
-    fn read_flash<W, F>(
+    /* Upload and boot a Download Agent */
+    fn upload_da<P: MtkPort>(&mut self, port: &mut P, da: &mut DaEntry<'_>) -> Result<()>;
+    /* Run and jump to code */
+    fn boot_to<P: MtkPort>(&mut self, port: &mut P, addr: u32, data: &[u8]) -> Result<()>;
+    /* Read data from the device, size is automatically determined by the protocol */
+    fn read_data<P: MtkPort>(&mut self, port: &mut P) -> Result<Vec<u8>>;
+    /* Send data to the device */
+    fn send<P: MtkPort>(&mut self, port: &mut P, data: &[u8]) -> Result<()>;
+    /* Send multiple data buffers to the device */
+    fn send_data<P: MtkPort>(&mut self, port: &mut P, data: &[&[u8]]) -> Result<()>;
+    /* Shutdown the device */
+    fn shutdown<P: MtkPort>(&mut self, port: &mut P) -> Result<()>;
+    /* Reboot the device to the specified BootMode */
+    fn reboot<P: MtkPort>(&mut self, port: &mut P, mode: BootMode) -> Result<()>;
+
+    /* Sends data to the device in chunks, with progress reporting,
+     * using the protocol specific loop logic.
+     */
+    fn download_data<R: Reader, F: ProgressCallback, P: MtkPort>(
         &mut self,
+        port: &mut P,
+        size: usize,
+        reader: R,
+        progress: F,
+    ) -> Result<usize>;
+
+    /* Receives data from the device in chunks, with progress reporting,
+     * using the protocol specific loop logic.
+     */
+    fn upload_data<W: Writer, F: ProgressCallback, P: MtkPort>(
+        &mut self,
+        port: &mut P,
+        size: usize,
+        writer: W,
+        progress: F,
+    ) -> Result<usize>;
+
+    /* Reports progress to the device, using the protocol specific loop logic.
+     * This is used for operations that don't involve data transfer, but still need to report
+     * progress.
+     */
+    fn progress_report<F: ProgressCallback, P: MtkPort>(
+        &mut self,
+        port: &mut P,
+        size: usize,
+        progress: F,
+    ) -> Result<()>;
+
+    /* Flash RW */
+
+    /* Reads the flash at the given address with the given size, in the specified section */
+    fn read_flash<W: Writer, F: ProgressCallback, P: MtkPort>(
+        &mut self,
+        port: &mut P,
         addr: u64,
         size: usize,
         section: PartitionKind,
         writer: W,
         progress: F,
-    ) -> Result<()>
-    where
-        W: Write + Send,
-        F: FnMut(usize, usize) + Send;
+    ) -> Result<()>;
 
-    fn write_flash<R, F>(
+    /* Writes the flash at the given address with the given size, in the specified section */
+    fn write_flash<R: Reader, F: ProgressCallback, P: MtkPort>(
         &mut self,
+        port: &mut P,
         addr: u64,
         size: usize,
         section: PartitionKind,
         reader: R,
         progress: F,
-    ) -> Result<()>
-    where
-        R: Read + Send,
-        F: FnMut(usize, usize) + Send;
+    ) -> Result<()>;
 
-    fn erase_flash<F>(
+    /* Erases the flash at the given address with the given size, in the specified section */
+    fn erase_flash<F: ProgressCallback, P: MtkPort>(
         &mut self,
+        port: &mut P,
         addr: u64,
         size: usize,
         section: PartitionKind,
         progress: F,
-    ) -> Result<()>
-    where
-        F: FnMut(usize, usize) + Send;
+    ) -> Result<()>;
 
-    fn download<R, F>(
+    /* Reads the specified partition (like read flash, but with partition names) */
+    fn read_partition<W: Writer, F: ProgressCallback, P: MtkPort>(
         &mut self,
-        part_name: &str,
+        port: &mut P,
+        name: &str,
+        writer: W,
+        progress: F,
+    ) -> Result<()>;
+
+    /* Writes the specified partition (like write flash, but with partition names) */
+    fn write_partition<R: Reader, F: ProgressCallback, P: MtkPort>(
+        &mut self,
+        port: &mut P,
+        name: &str,
         size: usize,
         reader: R,
         progress: F,
+    ) -> Result<()>;
+
+    fn format_partition<F: ProgressCallback, P: MtkPort>(
+        &mut self,
+        port: &mut P,
+        name: &str,
+        progress: F,
+    ) -> Result<()>;
+
+    fn flash_scatter<P, F, R, W, S, K>(
+        &mut self,
+        port: &mut P,
+        scatter: &str,
+        reader_source: S,
+        writer_sink: K,
+        progress: F,
     ) -> Result<()>
     where
-        R: Read + Send,
-        F: FnMut(usize, usize) + Send;
+        P: MtkPort,
+        R: Reader,
+        W: Writer,
+        S: ReaderSource<R>,
+        K: WriterSink<W>,
+        F: ProgressCallback;
 
-    fn upload<W, F>(&mut self, part_name: &str, writer: W, progress: F) -> Result<()>
-    where
-        W: Write + Send,
-        F: FnMut(usize, usize) + Send;
-
-    fn format<F>(&mut self, part_name: &str, progress: F) -> Result<()>
-    where
-        F: FnMut(usize, usize) + Send;
-
-    // Memory
-    fn read32(&mut self, addr: u32) -> Result<u32>;
-    fn write32(&mut self, addr: u32, value: u32) -> Result<()>;
-
-    fn get_usb_speed(&mut self) -> Result<u32>;
-    // fn set_usb_speed(&mut self, speed: u32) -> Result<(), Error>;
-
-    // Connection
-    fn get_connection(&mut self) -> &mut Connection;
-    fn set_connection_type(&mut self, conn_type: ConnectionType) -> Result<()>;
-
-    fn get_storage(&mut self) -> Option<StorageKind>;
-    fn get_storage_type(&mut self) -> StorageType;
-    fn get_partitions(&mut self) -> Vec<Partition>;
-
-    // DevInfo helpers
-    fn get_devinfo(&self) -> DeviceInfo;
-    fn get_da(&self) -> &DA;
-
-    fn chip(&self) -> &'static ChipInfo {
-        self.get_devinfo().chip()
+    fn get_storage<P: MtkPort>(&mut self, port: &mut P) -> Option<&StorageKind>;
+    fn get_storage_type<P: MtkPort>(&mut self, port: &mut P) -> StorageType;
+    fn partitions<P: MtkPort>(&mut self, port: &mut P) -> Partitions;
+    fn get_partition(&mut self, name: &str) -> Option<Partition> {
+        self.get_devinfo().get_partition(name)
     }
 
-    /* EXTENSIONS / EXPLOITS
-     * These functions won't be included if the "no_exploits" feature is enabled
-     */
+    /* Efuses */
 
-    // Sec
-    #[cfg(not(feature = "no_exploits"))]
-    fn set_seccfg_lock_state(&mut self, locked: LockFlag) -> Option<[u8; 512]>;
-
-    #[cfg(not(feature = "no_exploits"))]
-    fn peek<W, F>(&mut self, addr: u32, length: usize, writer: W, progress: F) -> Result<()>
-    where
-        W: Write + Send,
-        F: FnMut(usize, usize) + Send;
-
-    #[cfg(not(feature = "no_exploits"))]
-    fn poke<R, F>(&mut self, addr: u32, length: usize, reader: R, progress: F) -> Result<()>
-    where
-        R: Read + Send,
-        F: FnMut(usize, usize) + Send;
-
-    #[cfg(not(feature = "no_exploits"))]
-    fn read_rpmb<W, F>(
+    /* Reads efuses and writes the raw response into the provided buffer */
+    fn read_efuses<W: Writer, P: MtkPort>(&mut self, port: &mut P, writer: W) -> Result<()>;
+    /* Writes efuses from the provided buffer */
+    fn write_efuses<R: Reader, P: MtkPort>(
         &mut self,
-        region: RpmbRegion,
-        start_sector: u32,
-        sectors_count: u32,
+        port: &mut P,
+        reader: R,
+        size: usize,
+    ) -> Result<()>;
+
+    /* Security */
+
+    /* Handles DA SLA.
+     * If the `exploits` feature flag is enabled, it will attempt to bypass SLA
+     * with dummy signature.
+     */
+    fn handle_sla<P: MtkPort>(&mut self, port: &mut P, da: &DaEntry) -> Result<()>;
+
+    fn get_devinfo(&mut self) -> &DevInfo;
+}
+
+#[allow(dead_code)]
+#[cfg(not(feature = "exploits"))]
+#[enum_dispatch]
+pub trait DownloadProtocolExt: DownloadProtocol {}
+
+#[cfg(feature = "exploits")]
+#[enum_dispatch]
+pub trait DownloadProtocolExt {
+    /* Security */
+
+    /* Sets the lock state in the `seccfg` partition */
+    fn set_seccfg_lock_state<P: MtkPort>(
+        &mut self,
+        port: &mut P,
+        state: hacc::LockState,
+    ) -> Result<()>;
+
+    /* Sets the lock state in RPMB (UFS only) */
+    fn set_rpmb_lock_state<P: MtkPort>(
+        &mut self,
+        port: &mut P,
+        state: hacc::LockState,
+    ) -> Result<()>;
+
+    /* Memory */
+
+    /* Read memory at the given address with the given length */
+    fn peek<W: Writer, F: ProgressCallback, P: MtkPort>(
+        &mut self,
+        port: &mut P,
+        addr: u64,
+        length: usize,
         writer: W,
         progress: F,
-    ) -> Result<()>
-    where
-        W: Write + Send,
-        F: FnMut(usize, usize) + Send;
+    ) -> Result<()>;
 
-    #[cfg(not(feature = "no_exploits"))]
-    fn write_rpmb<R, F>(
+    /* Write memory at the given address with the given length */
+    fn poke<R: Reader, F: ProgressCallback, P: MtkPort>(
         &mut self,
-        region: RpmbRegion,
-        start_sector: u32,
-        sectors_count: u32,
+        port: &mut P,
+        addr: u64,
+        length: usize,
         reader: R,
         progress: F,
-    ) -> Result<()>
-    where
-        R: Read + Send,
-        F: FnMut(usize, usize) + Send;
+    ) -> Result<()>;
 
-    #[cfg(not(feature = "no_exploits"))]
-    fn auth_rpmb(&mut self, region: RpmbRegion, key: &[u8]) -> Result<()>;
+    /* Return the value of the register at the given address */
+    fn read_register<P: MtkPort>(&mut self, port: &mut P, addr: u64) -> Result<u32>;
+    /* Writes value to the register at the given address */
+    fn write_register<P: MtkPort>(&mut self, port: &mut P, addr: u64, value: u32) -> Result<()>;
 
-    /// Derives the device RPMB key and verifies it against the authenticated
-    /// write-counter response without writing RPMB data.
-    #[cfg(not(feature = "no_exploits"))]
-    fn verify_derived_rpmb_key(&mut self, region: RpmbRegion) -> Result<()>;
+    /* RPMB */
 
-    /// Returns the authenticated 256-byte sector count for an RPMB region.
-    #[cfg(not(feature = "no_exploits"))]
-    fn get_rpmb_sector_count(&mut self, region: RpmbRegion) -> Result<u32>;
+    /* Read the specified RPMB region with `num_sectors` starting at `start_sector` */
+    fn read_rpmb<W: Writer, F: ProgressCallback, P: MtkPort>(
+        &mut self,
+        port: &mut P,
+        region: RpmbRegion,
+        start_sector: u32,
+        num_sectors: u32,
+        writer: W,
+        progress: F,
+    ) -> Result<()>;
 
-    /// Returns whether an RPMB region is enabled and its configured sector count.
-    #[cfg(not(feature = "no_exploits"))]
-    fn get_rpmb_region_info(&mut self, region: RpmbRegion) -> Result<(bool, u32)>;
+    /* Write the specified RPMB region with `num_sectors` starting at `start_sector` */
+    fn write_rpmb<R: Reader, F: ProgressCallback, P: MtkPort>(
+        &mut self,
+        port: &mut P,
+        region: RpmbRegion,
+        start_sector: u32,
+        num_sectors: u32,
+        reader: R,
+        progress: F,
+    ) -> Result<()>;
 
-    // DA Patching utils. These *must* be protocol specific, as different protocols
-    // have different DA implementations
-    #[cfg(not(feature = "no_exploits"))]
-    fn patch_da(&mut self) -> Option<DA>;
-    #[cfg(not(feature = "no_exploits"))]
-    fn patch_da1(&mut self) -> Option<DAEntryRegion>;
-    #[cfg(not(feature = "no_exploits"))]
-    fn patch_da2(&mut self) -> Option<DAEntryRegion>;
+    /* Erase the specified RPMB region with `num_sectors` starting at `start_sector` */
+    fn erase_rpmb<F: ProgressCallback, P: MtkPort>(
+        &mut self,
+        port: &mut P,
+        region: RpmbRegion,
+        start_sector: u32,
+        num_sectors: u32,
+        progress: F,
+    ) -> Result<()>;
+
+    /* Authenticates the given key for the specified RPMB region.
+     * If the RPMB region is already authenticated, it will return Ok */
+    fn auth_rpmb<P: MtkPort>(&mut self, port: &mut P, region: RpmbRegion, key: &[u8])
+    -> Result<()>;
+
+    /// Returns whether an RPMB region is enabled and its configured 256-byte sector count.
+    fn get_rpmb_region_info<P: MtkPort>(
+        &mut self,
+        port: &mut P,
+        region: RpmbRegion,
+    ) -> Result<(bool, u32)>;
+
+    /* Crypto */
+
+    /* Encrypts / Decrypts, based on params, the given data in reader and writes the result to
+     * writer */
+    fn sej_aes<R: Reader, W: Writer, P: MtkPort>(
+        &mut self,
+        port: &mut P,
+        params: super::extensions::SejParams,
+        reader: R,
+        writer: W,
+    ) -> Result<()>;
+
+    /* Derives the specified key */
+    fn derive_key<P: MtkPort>(
+        &mut self,
+        port: &mut P,
+        params: super::extensions::KeyDeriveParams,
+    ) -> Result<Vec<u8>>;
+
+    /* Da patching */
+
+    fn patch_da(&mut self, da: &mut DaEntry) -> Result<()>;
+    fn patch_da1(&mut self, da: &mut DaEntry) -> Result<()>;
+    fn patch_da2(&mut self, da: &mut DaEntry) -> Result<()>;
 }

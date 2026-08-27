@@ -1,47 +1,68 @@
 /*
-    SPDX-License-Identifier:  AGPL-3.0-or-later
+    SPDX-License-Identifier: AGPL-3.0-or-later
     SPDX-FileCopyrightText: 2025-2026 Shomy
 */
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use crate::components::ThemedWidgetMut;
+use crate::components::Component;
 use crate::themes::Theme;
 
-#[derive(Clone)]
-pub struct DescriptionMenuItem {
+#[derive(Clone, Debug)]
+pub struct DescriptionMenuItem<A> {
     pub icon: char,
     pub label: String,
     pub description: String,
+    pub action: A,
 }
 
-pub struct DescriptionMenu {
-    pub items: Vec<DescriptionMenuItem>,
+impl<A> DescriptionMenuItem<A> {
+    pub fn new(
+        icon: char,
+        label: impl Into<String>,
+        description: impl Into<String>,
+        action: A,
+    ) -> Self {
+        Self { icon, label: label.into(), description: description.into(), action }
+    }
+}
+
+pub struct DescriptionMenu<A> {
+    pub items: Vec<DescriptionMenuItem<A>>,
     pub selected: usize,
     scroll_offset: usize,
     max_visible: usize,
 }
 
-impl DescriptionMenu {
-    pub fn new(items: Vec<DescriptionMenuItem>) -> Self {
-        Self { items, selected: 0, scroll_offset: 0, max_visible: 8 }
+impl<A> DescriptionMenu<A> {
+    const MAX_VISIBLE: usize = 8;
+
+    pub const fn new(items: Vec<DescriptionMenuItem<A>>) -> Self {
+        Self { items, selected: 0, scroll_offset: 0, max_visible: Self::MAX_VISIBLE }
     }
 
-    pub fn next(&mut self) {
+    pub fn selected_action(&self) -> Option<&A> {
+        self.items.get(self.selected).map(|item| &item.action)
+    }
+
+    pub fn selected_item(&self) -> Option<&DescriptionMenuItem<A>> {
+        self.items.get(self.selected)
+    }
+
+    pub const fn selected_index(&self) -> usize {
+        self.selected
+    }
+
+    pub const fn next(&mut self) {
         if self.items.is_empty() {
             return;
         }
-        if self.selected + 1 >= self.items.len() {
-            self.selected = 0;
-        } else {
-            self.selected += 1;
-        }
+        self.selected = (self.selected + 1) % self.items.len();
         self.adjust_scroll();
     }
 
-    pub fn previous(&mut self) {
+    pub const fn previous(&mut self) {
         if self.items.is_empty() {
             return;
         }
@@ -53,11 +74,7 @@ impl DescriptionMenu {
         self.adjust_scroll();
     }
 
-    pub fn selected_index(&self) -> usize {
-        self.selected
-    }
-
-    fn adjust_scroll(&mut self) {
+    const fn adjust_scroll(&mut self) {
         if self.selected < self.scroll_offset {
             self.scroll_offset = self.selected;
         } else if self.selected >= self.scroll_offset + self.max_visible {
@@ -66,19 +83,17 @@ impl DescriptionMenu {
     }
 
     pub fn set_max_visible(&mut self, max: usize) {
-        self.max_visible = max.max(1).min(self.items.len());
+        self.max_visible = max.max(1).min(self.items.len().max(1));
         self.adjust_scroll();
     }
 
     fn wrap_text(s: &str, max_width: usize) -> Vec<String> {
-        let words = s.split_whitespace().peekable();
         let mut lines = Vec::new();
         let mut current = String::new();
-        for word in words {
-            if current.len() + word.len() + 1 > max_width {
-                if !current.is_empty() {
-                    lines.push(current.clone());
-                }
+
+        for word in s.split_whitespace() {
+            if !current.is_empty() && current.len() + word.len() + 1 > max_width {
+                lines.push(current.clone());
                 current.clear();
             }
             if !current.is_empty() {
@@ -86,6 +101,7 @@ impl DescriptionMenu {
             }
             current.push_str(word);
         }
+
         if !current.is_empty() {
             lines.push(current);
         }
@@ -93,9 +109,12 @@ impl DescriptionMenu {
     }
 }
 
-impl ThemedWidgetMut for DescriptionMenu {
+impl<A> Component for DescriptionMenu<A> {
     fn render(&mut self, area: Rect, buf: &mut Buffer, theme: &Theme) {
-        // TODO: Stop using magic values here
+        if self.items.is_empty() {
+            return;
+        }
+
         let y_spacing = 1u16;
         let avail = (area.height.saturating_sub(2)) as usize;
         self.set_max_visible(avail);
@@ -103,74 +122,49 @@ impl ThemedWidgetMut for DescriptionMenu {
         let menu_width = 24u16;
         let desc_pad = 4u16;
         let desc_width = (area.width.saturating_sub(menu_width + desc_pad)).clamp(18, 36);
+        let n_shown = self.items.len().min(self.max_visible);
 
-        let n_shown = self.max_visible.min(self.items.len());
-        let menu_height = n_shown as u16 * y_spacing;
-        let start_y = area.y + (area.height.saturating_sub(menu_height)).saturating_div(2);
-
-        let base_x = area.x + area.width / 2 - ((menu_width + desc_pad + desc_width) / 2);
-        let desc_x = base_x + menu_width + desc_pad;
-
-        let items = &self.items;
-        let win_start = self.scroll_offset;
-        let win_end = (win_start + self.max_visible).min(items.len());
-
-        let mut selected_desc: Option<String> = None;
-        for (visible_idx, i) in (win_start..win_end).enumerate() {
-            let item = &items[i];
-            let is_selected = i == self.selected;
-            let y = start_y + visible_idx as u16 * y_spacing;
-
-            if is_selected {
-                selected_desc = Some(item.description.clone());
+        for i in 0..n_shown {
+            let idx = self.scroll_offset + i;
+            if idx >= self.items.len() {
+                break;
             }
 
-            let style = if is_selected {
-                Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(theme.text)
-            };
+            let item = &self.items[idx];
+            let is_selected = idx == self.selected;
+            let y = area.y + (i as u16) * (1 + y_spacing);
 
-            let text = format!("{}  {}", item.icon, item.label);
-            buf.set_string(base_x, y, &text, style);
+            let prefix = if is_selected { "> " } else { "  " };
+            let style = if is_selected { theme.style_highlight() } else { theme.style_text() };
+
+            let line = Line::from(vec![
+                Span::styled(prefix, style),
+                Span::styled(format!("{} ", item.icon), style),
+                Span::styled(&item.label, style),
+            ]);
+
+            buf.set_line(area.x, y, &line, menu_width);
         }
 
-        // Only appear when there's more to scroll btw
-        if self.scroll_offset > 0 {
-            buf.set_string(
-                base_x,
-                start_y.saturating_sub(1),
-                "↑",
-                Style::default().fg(theme.muted),
-            );
-        }
-        if win_end < items.len() {
-            let y = start_y + self.max_visible as u16 * y_spacing;
-            if y < area.y + area.height {
-                buf.set_string(base_x, y, "↓", Style::default().fg(theme.muted));
-            }
-        }
+        if let Some(item) = self.selected_item() {
+            let desc_x = area.x + menu_width + desc_pad;
+            let lines = Self::wrap_text(&item.description, desc_width.saturating_sub(4) as usize);
 
-        if let Some(desc) = selected_desc {
-            let sel_y = start_y;
-            let max_box_height = area.height.saturating_sub(2).min(6);
-            let lines = Self::wrap_text(&desc, (desc_width - 4) as usize);
-            let content_lines = lines.iter().take((max_box_height as usize).saturating_sub(2));
-            let box_height = 2 + content_lines.len() as u16;
+            let box_height = (lines.len() as u16 + 2).min(area.height);
+            let max_box_height = area.height.min(box_height);
 
-            let mut box_y = sel_y;
+            let mut box_y = area.y
+                + (self.selected.saturating_sub(self.scroll_offset) as u16) * (1 + y_spacing);
             if box_y + box_height > area.y + area.height {
-                box_y = area.y + area.height - box_height;
-            }
-            if box_y < area.y {
-                box_y = area.y;
+                box_y = (area.y + area.height).saturating_sub(box_height);
             }
 
             let accent_top = format!("╭{}╮", "─".repeat(desc_width.saturating_sub(2) as usize));
-            buf.set_string(desc_x, box_y, &accent_top, Style::default().fg(theme.foreground));
+            buf.set_string(desc_x, box_y, &accent_top, theme.style_border(false));
+
             for (j, line) in lines.iter().enumerate() {
                 let y = box_y + 1 + j as u16;
-                if (j as u16) + 1 >= max_box_height - 1 || y >= area.y + area.height {
+                if (j as u16) + 1 >= max_box_height.saturating_sub(1) || y >= area.y + area.height {
                     continue;
                 }
 
@@ -178,14 +172,9 @@ impl ThemedWidgetMut for DescriptionMenu {
                 let padded_text = format!("{:<width$}", line, width = line_width);
 
                 let line_spans = Line::from(vec![
-                    Span::styled("│ ", Style::default().fg(theme.foreground)),
-                    Span::styled(
-                        padded_text,
-                        Style::default()
-                            .fg(theme.info)
-                            .add_modifier(Modifier::ITALIC | Modifier::BOLD),
-                    ),
-                    Span::styled(" │", Style::default().fg(theme.foreground)),
+                    Span::styled("│ ", theme.style_border(false)),
+                    Span::styled(padded_text, theme.style_info()),
+                    Span::styled(" │", theme.style_border(false)),
                 ]);
 
                 buf.set_line(desc_x, y, &line_spans, desc_width);
@@ -194,9 +183,9 @@ impl ThemedWidgetMut for DescriptionMenu {
             let accent_bottom = format!("╰{}╯", "─".repeat(desc_width.saturating_sub(2) as usize));
             buf.set_string(
                 desc_x,
-                box_y + box_height - 1,
+                box_y + box_height.saturating_sub(1),
                 &accent_bottom,
-                Style::default().fg(theme.foreground),
+                theme.style_border(false),
             );
         }
     }

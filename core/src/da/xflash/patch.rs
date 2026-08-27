@@ -5,252 +5,175 @@
 
 const EXT_LOADER: &[u8] = include_bytes!("../../../payloads/extloader_v5.bin");
 
-use log::{info, warn};
+use hacc::DaEntry;
+use log::{debug, info, warn};
 
-use crate::da::xflash::XFlash;
-use crate::da::{DA, DAEntryRegion};
-use crate::error::Result;
-use crate::utilities::analysis::{ArchAnalyzer, Thumb2Analyzer};
-use crate::utilities::arm::*;
-use crate::utilities::hash::hash;
-use crate::utilities::patching::*;
+use crate::da::xflash::Cmd;
+use crate::error::{Result, XFlashErrorKind};
+use crate::exploit::DaEntryExt;
+use crate::utils::analysis::{Analyzer, ArchAnalyzer, Thumb2Analyzer};
+use crate::utils::hash::hash;
+use crate::utils::patching::*;
 
-/// Patches both DA1 and DA2, specific for V5 DA
-pub fn patch_da(xflash: &XFlash) -> Result<DA> {
-    let da2 = patch_da2(xflash)?;
-    let mut da1 = patch_da1(xflash)?;
+const FORCE_RETURN_PATCH: &[u8] = &[0x00, 0x20, 0x70, 0x47]; // movs r0, #0; bx lr
 
-    let hash_pos = xflash.da.find_da_hash_offset();
-    match hash_pos {
-        Some(pos) => {
-            let hash_type = xflash.da.get_hash_type();
-            let hash_result =
-                hash(hash_type, &da2.data[..da2.data.len().saturating_sub(da2.sig_len as usize)]);
-            patch(&mut da1.data, pos, &bytes_to_hex(&hash_result))?;
-
-            let original_da = &xflash.da;
-            let da = DA {
-                da_type: xflash.da.da_type,
-                regions: vec![original_da.regions[0].clone(), da1.clone(), da2],
-                magic: original_da.magic,
-                hw_code: original_da.hw_code,
-                hw_sub_code: original_da.hw_sub_code,
-            };
-            Ok(da)
-        }
-        None => {
-            info!("[Penumbra] Could not find DA1 hash position, skipping patching");
-            Ok(xflash.da.clone())
-        }
-    }
+pub fn patch_da(da: &mut DaEntry) -> Result<()> {
+    patch_da2(da)?;
+    patch_da1(da)?;
+    Ok(())
 }
 
-/// Patches only DA1, specific for V5 DA
-pub fn patch_da1(xflash: &XFlash) -> Result<DAEntryRegion> {
-    let mut da1 = xflash.da.get_da1().cloned().unwrap();
-    patch_anti_rollback(&mut da1, "DA1")?;
-    Ok(da1)
+pub fn patch_da1(da: &mut DaEntry) -> Result<()> {
+    let Some(hash_pos) = da.hash_offset() else {
+        warn!("Could not find DA1 hash position, skipping patching");
+        return Ok(());
+    };
+
+    let hash_type = da.get_hash_type();
+    let da2_code = da.da2_code();
+    let hash_result = hash(hash_type, da2_code);
+
+    debug!("New DA1 hash: {:X?}", hash_result);
+
+    let da1_data = da.da1_data_mut();
+
+    patch(da1_data, hash_pos, &hash_result)?;
+    patch_u32(da1_data, XFlashErrorKind::DaHashMismatch as u32, 0)
+        .map(|_| info!("Patched DA1 hash check"))
+        .ok();
+    patch_anti_rollback(da1_data).map(|_| info!("Patched DA1 anti-rollback.")).ok();
+
+    Ok(())
 }
 
-/// Patches only DA2, specific for V5 DA
-pub fn patch_da2(xflash: &XFlash) -> Result<DAEntryRegion> {
-    let mut da2 = xflash.da.get_da2().cloned().unwrap();
+pub fn patch_da2(da: &mut DaEntry) -> Result<()> {
+    let da2_addr = da.da2().addr();
+    let da2_data = da.da2_data();
 
-    let analyzer = Thumb2Analyzer::new(da2.data.clone(), da2.addr as u64);
+    debug!("Patching DA2 with VA: 0x{:08X}", da2_addr);
 
-    patch_security(&mut da2, &analyzer)?;
-    patch_boot_to(&mut da2, &analyzer)?;
+    let analyzer = Analyzer::Thumb2(Thumb2Analyzer::new(da2_data.into(), da2_addr as u64));
+    let data = da.da2_data_mut();
 
-    Ok(da2)
-}
+    patch_boot_to(data, &analyzer)?;
+    patch_anti_rollback(data).map(|_| info!("Patched DA2 anti-rollback.")).ok();
+    patch_da_sla(data, &analyzer)?;
+    patch_security(data, &analyzer)?;
+    patch_u32(data, 0x4340F003, 0x300F003)
+        .map(|_| info!("Patched DA2 cmd loop error handling."))
+        .ok();
 
-fn patch_security(da: &mut DAEntryRegion, analyzer: &Thumb2Analyzer) -> Result<bool> {
-    patch_lock_state(da, analyzer)?;
-    patch_sec_policy(da, analyzer)?;
-    patch_anti_rollback(da, "DA2")?;
-    patch_da_sla(da, analyzer)
+    Ok(())
 }
 
 /// Disables the DA version anti-rollback check by overwriting the
 /// 0xC0020053 error constant in the DA's literal pool with 0, so the
 /// error-return path returns success and older DA versions are accepted.
-fn patch_anti_rollback(da: &mut DAEntryRegion, label: &str) -> Result<bool> {
-    let pos = find_pattern(&da.data, "530002C0", 0);
-    if pos == HEX_NOT_FOUND {
-        return Ok(false);
-    }
-
-    patch(&mut da.data, pos, "00000000")?;
-    info!("Patched {label} version anti-rollback.");
+fn patch_anti_rollback(data: &mut [u8]) -> Result<bool> {
+    patch_u32(data, XFlashErrorKind::DaVersionAntiRollbackError as u32, 0)?;
     Ok(true)
 }
 
-fn patch_lock_state(da: &mut DAEntryRegion, analyzer: &Thumb2Analyzer) -> Result<bool> {
-    #[rustfmt::skip]
-    let lks_patch = vec![
-            0x00, 0x23, // movs r3, #0
-            0x03, 0x60, // str r3, [r0, #0]
-            0x00, 0x20, // movs r0, #0
-            0x10, 0xBD, // pop {r4, pc}
-        ];
-
-    let Some(off) = analyzer.find_function_from_string("[SEC_POLICY] lock_state = 0x") else {
-        warn!("Could not patch lock state!");
+/// Disables security checks in DA2 in `cmd_download`, `cmd_format`, `cmd_write_data`
+fn patch_security(da: &mut [u8], analyzer: &Analyzer) -> Result<bool> {
+    let Some(cmd_download_log) = analyzer.str_xref("cmd_download") else {
+        warn!("Could not patch security!");
         return Ok(false);
     };
 
-    let sboot_state_bl = analyzer.get_next_bl_from_off(off).unwrap_or(0);
-
-    let seccfg_bl = analyzer.get_next_bl_from_off(sboot_state_bl + 4).unwrap_or(0);
-    let get_lock_state = analyzer.get_bl_target(seccfg_bl).unwrap_or(0);
-    let get_lock_state_off = analyzer.va_to_offset(get_lock_state).unwrap_or(0);
-
-    if get_lock_state_off == 0 {
-        warn!("Could not find lock state function to patch!");
+    let Some(security_enabled_bl) = analyzer
+        .next_bl_from_off(cmd_download_log)
+        .and_then(|off| analyzer.next_bl_from_off(off + 4))
+    else {
+        warn!("Could not patch security!");
         return Ok(false);
-    }
+    };
 
-    patch(&mut da.data, get_lock_state_off, &bytes_to_hex(&lks_patch))?;
-    info!("Patched DA2 to always report unlocked state.");
+    let Some(security_func) =
+        analyzer.bl_target(security_enabled_bl).and_then(|va| analyzer.va_to_off(va))
+    else {
+        warn!("Could not patch security!");
+        return Ok(false);
+    };
+
+    // movs r3, #0x1 -> movs r3, #0x0
+    patch(da, security_func, &0x2300_u16.to_le_bytes())?;
+
+    info!("Patched DA2 to skip security check.");
+
     Ok(true)
-}
-
-fn patch_sec_policy(da: &mut DAEntryRegion, analyzer: &Thumb2Analyzer) -> Result<bool> {
-    const POLICY_FUNC: &str = "==========security policy==========";
-
-    let Some(part_sec_pol_off) = analyzer.find_function_from_string(POLICY_FUNC) else {
-        warn!("Could not find security policy function!");
-        return Ok(false);
-    };
-
-    // BL policy_index
-    // BL hash_binding
-    // BL verify_policy
-    // BL download_policy
-    let Some(policy_idx_bl) = analyzer.get_next_bl_from_off(part_sec_pol_off) else {
-        warn!("Could not find policy_idx call");
-        return Ok(false);
-    };
-    let Some(hash_binding_bl) = analyzer.get_next_bl_from_off(policy_idx_bl + 4) else {
-        warn!("Could not find hash_binding call");
-        return Ok(false);
-    };
-    let Some(verify_bl) = analyzer.get_next_bl_from_off(hash_binding_bl + 4) else {
-        warn!("Could not find verify_policy call");
-        return Ok(false);
-    };
-    let Some(download_bl) = analyzer.get_next_bl_from_off(verify_bl + 4) else {
-        warn!("Could not find download_policy call");
-        return Ok(false);
-    };
-
-    let targets =
-        [(hash_binding_bl, "Hash Binding"), (verify_bl, "Verification"), (download_bl, "Download")];
-
-    let mut patched_any = false;
-
-    for (bl_offset, desc) in targets {
-        if let Some(func_offset) = analyzer.get_bl_target_offset(bl_offset) {
-            force_return(&mut da.data, func_offset, 0, true)?;
-            info!("Patched DA2 to skip security policy ({desc})");
-            patched_any = true;
-        } else {
-            warn!("Failed to resolve target for {desc}");
-        }
-    }
-
-    if !patched_any {
-        warn!("Could not patch security policy!");
-    }
-
-    Ok(patched_any)
 }
 
 /// Adds back the boot_to command to da2, allowing to load extensions.
 /// This is needed only on DAs which build date is >= late 2023
-fn patch_boot_to(da: &mut DAEntryRegion, analyzer: &Thumb2Analyzer) -> Result<bool> {
-    // We only need to patch if the DA doesn't support this cmd.
-    if find_pattern(&da.data, "636D645F626F6F745F746F00", 0) != HEX_NOT_FOUND {
-        let Some(boot_to_off) = analyzer.find_function_from_string("cmd_boot_to") else {
-            warn!("Can't patch cmd_boot_to!");
-            return Ok(false);
-        };
-
-        patch(&mut da.data, boot_to_off, &bytes_to_hex(EXT_LOADER))?;
+/// On DA1, this allows to skip DA2 verification.
+fn patch_boot_to(da: &mut [u8], analyzer: &Analyzer) -> Result<bool> {
+    if let Some(boot_to_fn) = analyzer.fn_from_str("cmd_boot_to") {
+        patch(da, boot_to_fn, EXT_LOADER)?;
 
         info!("Patched DA2 boot_to!");
 
         return Ok(true);
     }
 
-    let dagent_reg_cmds = find_pattern(&da.data, "08B54FF460200021XXF7", 0);
-    let Some(devc_read_reg) = analyzer.find_function_from_string("devc_ctrl_read_register") else {
+    let Some(bootstrap) = analyzer.str_xref("\n***10.dagent_register_commands.\n") else {
         warn!("Can't patch cmd_boot_to!");
         return Ok(false);
     };
 
-    let unsupported_cmd = find_pattern(&da.data, "084B13B504460193", 0);
-    let Some(cmd_code) = patch_pattern_str(&mut da.data, "03000E00", "08000100") else {
+    // after this, there's bl + another bl, we want the second one, so we skip the first one
+    let da_reg_bl = bootstrap + 4;
+    let Some(da_reg_cmds) = analyzer.bl_target(da_reg_bl) else {
         warn!("Can't patch cmd_boot_to!");
         return Ok(false);
     };
 
-    let Some(off) = analyzer.get_next_bl_from_off(dagent_reg_cmds) else {
+    let Some(injection_off) = analyzer.fn_from_str("devc_set_all_in_one_signature") else {
         warn!("Can't patch cmd_boot_to!");
         return Ok(false);
     };
 
-    let unsupported_cmd_addr = to_thumb_addr(unsupported_cmd, da.addr).to_le_bytes();
-
-    let ldr_off = off + 4; // After the first bl, we replace movw
-    let ldr = encode_ldr(0, ldr_off, cmd_code + da.addr as usize, da.addr)?;
-
-    patch(&mut da.data, ldr_off, &bytes_to_hex(&ldr))?; // ldr r0, [#cmd_code]
-    patch(&mut da.data, ldr_off + 2, "00BF")?; // nop
-
-    let cmd_lit = find_pattern(&da.data, &bytes_to_hex(&unsupported_cmd_addr), dagent_reg_cmds);
-    if cmd_lit == HEX_NOT_FOUND {
+    let Some(cmd_code) =
+        find_pattern(da, &(Cmd::SetAllInOneSig as u32).to_le_bytes(), da_reg_cmds as usize)
+    else {
         warn!("Can't patch cmd_boot_to!");
         return Ok(false);
-    }
+    };
 
-    let devc_read_reg_addr = to_thumb_addr(devc_read_reg, da.addr).to_le_bytes();
+    patch(da, cmd_code, &(Cmd::BootTo as u32).to_le_bytes())?;
+    patch(da, injection_off, EXT_LOADER)?;
 
-    patch(&mut da.data, cmd_lit, &bytes_to_hex(&devc_read_reg_addr))?;
-    patch(&mut da.data, devc_read_reg, &bytes_to_hex(EXT_LOADER))?;
-
-    info!("Patched DA2 to add cmd_boot_to");
+    info!("Patched DA to add cmd_boot_to");
 
     Ok(true)
 }
 
-fn patch_da_sla(da: &mut DAEntryRegion, analyzer: &Thumb2Analyzer) -> Result<bool> {
-    let Some(devc_sla_status) = analyzer.find_string_xref("devc_get_sla_enabled_status") else {
+fn patch_da_sla(da: &mut [u8], analyzer: &Analyzer) -> Result<bool> {
+    let Some(devc_sla_status) = analyzer.str_xref("devc_get_sla_enabled_status") else {
         // If the DA doesn't have this string, it likely doesn't have SLA to begin with
         return Ok(true);
     };
 
     // dprintf
-    let Some(first_bl) = analyzer.get_next_bl_from_off(devc_sla_status) else {
+    let Some(first_bl) = analyzer.next_bl_from_off(devc_sla_status) else {
         warn!("Could not patch DA SLA!");
         return Ok(false);
     };
 
-    let Some(off) = analyzer.get_next_bl_from_off(first_bl + 4) else {
+    let Some(off) = analyzer.next_bl_from_off(first_bl + 4) else {
         warn!("Could not patch DA SLA!");
         return Ok(false);
     };
 
-    let target = analyzer.get_bl_target(off).unwrap_or(0);
+    let target = analyzer.bl_target(off).unwrap_or(0);
 
-    let target_off = analyzer.va_to_offset(target).unwrap_or(0);
-
-    if target_off != 0 {
-        force_return(&mut da.data, target_off, 0, true)?;
+    if let Some(target_off) = analyzer.va_to_off(target) {
+        patch(da, target_off, FORCE_RETURN_PATCH)?;
         info!("Patched DA2 SLA to be disabled.");
+
+        Ok(true)
     } else {
         warn!("Could not patch DA SLA!");
+        Ok(false)
     }
-
-    Ok(true)
 }

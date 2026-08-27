@@ -7,7 +7,7 @@ It provides flashing and readback capabilities, as well as bootloader unlocking 
 
 ## Requirements
 
-* On Windows, you'll need to install WinUsb or Libusb drivers on the device. You can use [Zadig](https://zadig.akeo.ie/) for that, or the provided driver installer.
+* On Windows, you'll need to install MediaTek VCOM drivers. For using `linecode` exploit (also known as Kamakiri2), you'll need to install either `libusb` or `WinUSB` drivers with [Zadig](https://zadig.akeo.ie/).
 * On Linux you'll need to install `libudev` and add your user to the `dialout` group. In case Penumbra doesn't recognize the device, run with sudo or allow access to the device with udev rules.
 
 ## Usage
@@ -31,17 +31,16 @@ fn main() -> Result<()> {
     let da_path = std::path::Path::new("../DA_penangf.bin");
     let da_data = std::fs::read(da_path).expect("Failed to read DA file");
 
-    println!("Searching for MTK port...");
-    let mtk_port = loop {
-        if let Some(port) = find_mtk_port() {
-            break port;
-        }
-    };
+    let vid = Some(0x0E8D);
+    let pid = Some(0x2000);
+    
+    let mtk_port = PortType::find_device(vid, pid, PortBackend::Auto)
+        .expect("Port should open")
+        .ok_or("No MTK port found")?;
 
     println!("Found MTK port: {}", mtk_port.get_port_name());
 
-    let mut device = DeviceBuilder::default()
-        .with_mtk_port(mtk_port)
+    let mut device = DeviceBuilder::new(mtk_port)
         .with_da_data(da_data)
         .build()?;
 
@@ -72,16 +71,16 @@ fn main() -> Result<()> {
 
 ### Debug logs
 
-Penumbra is still in early development, thus it can break quite easily.
+Some issues may be hard to reproduce, and may require more insight of what is happening on the device.
 If so, you can open an issue attaching debug logs.<br>
-To get debug logs, run `antumbra` with the `-v` flag. A file called `antumbra.log` will be created in the current directory.
+To get debug logs, run `antumbra` with the `-v` and `-l debug` flags. A file called `antumbra.log` will be created in the current directory.
 This will also enable UART debug logging. If possible, attach UART logs too.
 If you don't have UART, you can use the `--usb-log` flag in `antumbra` to enable DA logging over USB.
 A file called `da.log` will be created in the current directory with the logs.
 
 > [!NOTE]
-> Penumbra currently supports both V5 (XFlash) and V6 (XML) devices. Issues reporting incompatibility with other chipset will be ignored until broader support is added.
-> If your device falls in one of these categories and you get the "unknown hardware code" warning, please open an issue attaching your device info, and relevant firmware
+> Penumbra currently supports both V5 (XFlash) and V6 (XML) devices. Issues reporting incompatibility with older (V3/Legacy) chipsets will be ignored until broader support is added.
+> If your device falls in one of the supported protocols and you get the "unknown hardware code" warning, please open an issue attaching your device info, and relevant firmware
 > files (preloader, DA, lk).
 
 ## Contributing
@@ -99,17 +98,17 @@ Core:
 * [ ] Add amonet exploit
 
 TUI:
-* [ ] Refactor the TUI code to be more maintainable
-* [ ] Add reusable components
-* [ ] Make better key bindings
+* [x] Refactor the TUI code to be more maintainable
+* [x] Add reusable components
+* [x] Make better key bindings
 
 CLI:
 * [ ] Add plstage
-* [ ] Add Read Offset, Write Offset and Erase Offset commands
-* [ ] Add register read/write commands
+* [x] Add Read Offset, Write Offset and Erase Offset commands
+* [x] Add register read/write commands
 
 Documentation:
-* [ ] Add documentation for the crate
+* [x] Add documentation for the crate
 * [ ] Add linecode exploit documentation
 
 ## Learning Resources
@@ -126,6 +125,7 @@ Other learning resources I suggest are the following
 * [fenrir](https://github.com/R0rt1z2/fenrir)
 * [sprig](https://github.com/R0rt1z2/sprig)
 * [HeapB8 exploit technical writeup](https://blog.r0rt1z2.com/posts/exploiting-mediatek-datwo/)
+* [hacc](https://github.com/shomykohai/hacc)
 
 ## Credits
 
@@ -134,10 +134,5 @@ Other learning resources I suggest are the following
 ## License
 
 Penumbra is licensed under the GNU Affero General Public License v3 or later (AGPL-3.0-or-later), see [LICENSE](LICENSE) for details.
-
-Some limited parts of the code in Penumbra are adapted from [mtkclient](https://github.com/bkerler/mtkclient). 
-The code adapted from mtkclient is licensed under the GNU Public License v3 or later (GPL-3.0).
-
-As for term 13 of the GPL-3.0 license, the GPL-3.0 components must comply the networking terms of the AGPL-3.0 license when used together.
 
 Logo by [@archaeopteryz](https://github.com/archaeopteryz), all rights reserved. Use is allowed only for referencing "Penumbra" or "Antumbra", unless explicit permission has been granted.

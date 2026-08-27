@@ -10,7 +10,7 @@ use anyhow::Result;
 use clap::Args;
 use clap_num::maybe_hex;
 use log::info;
-use penumbra::Device;
+use penumbra::{Device, MtkPort};
 
 use crate::cli::DeviceCommand;
 use crate::cli::common::{CONN_DA, CommandMetadata};
@@ -20,8 +20,8 @@ use crate::cli::state::PersistedDeviceState;
 #[derive(Args, Debug)]
 pub struct PeekArgs {
     /// The address to read from.
-    #[clap(value_parser=maybe_hex::<u32>)]
-    pub address: u32,
+    #[clap(value_parser=maybe_hex::<u64>)]
+    pub address: u64,
     /// The number of bytes to read.
     #[clap(value_parser=maybe_hex::<usize>)]
     pub length: usize,
@@ -40,7 +40,7 @@ impl CommandMetadata for PeekArgs {
 }
 
 impl DeviceCommand for PeekArgs {
-    fn run(&self, dev: &mut Device, state: &mut PersistedDeviceState) -> Result<()> {
+    fn run<P: MtkPort>(&self, dev: &mut Device<P>, state: &mut PersistedDeviceState) -> Result<()> {
         dev.enter_da_mode()?;
 
         state.connection_type = CONN_DA;
@@ -62,7 +62,7 @@ impl DeviceCommand for PeekArgs {
             Ok(_) => {}
             Err(e) => {
                 pb.abandon("Read failed!");
-                return Err(e)?;
+                Err(e)?;
             }
         }
 

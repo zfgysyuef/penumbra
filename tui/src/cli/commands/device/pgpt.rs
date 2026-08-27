@@ -7,7 +7,7 @@ use anyhow::Result;
 use clap::Args;
 use human_bytes::human_bytes;
 use log::info;
-use penumbra::Device;
+use penumbra::{Device, MtkPort};
 
 use crate::cli::DeviceCommand;
 use crate::cli::common::{CONN_DA, CommandMetadata};
@@ -31,13 +31,13 @@ impl CommandMetadata for PgptArgs {
 }
 
 impl DeviceCommand for PgptArgs {
-    fn run(&self, dev: &mut Device, state: &mut PersistedDeviceState) -> Result<()> {
+    fn run<P: MtkPort>(&self, dev: &mut Device<P>, state: &mut PersistedDeviceState) -> Result<()> {
         dev.enter_da_mode()?;
 
         state.connection_type = CONN_DA;
         state.flash_mode = 1;
 
-        let partitions = dev.dev_info.partitions();
+        let partitions = dev.partitions();
 
         info!("Partition Table:");
         for p in partitions {
@@ -47,7 +47,7 @@ impl DeviceCommand for PgptArgs {
                 p.address,
                 p.size,
                 format!("({})", human_bytes(p.size as f64)),
-                p.kind.as_str()
+                Into::<&str>::into(p.kind)
             );
         }
 

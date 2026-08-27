@@ -6,9 +6,8 @@
 use anyhow::Result;
 use clap::{Args, ValueEnum};
 use log::info;
-use penumbra::Device;
-use penumbra::core::bootctrl::{BootControl, BootPartition, OFFSET_SLOT_SUFFIX};
-use wincode::Serialize;
+use penumbra::hacc::{BootControl, BootPartition, OFFSET_SLOT_SUFFIX, TryWrite};
+use penumbra::{Device, MtkPort};
 
 use crate::cli::DeviceCommand;
 use crate::cli::common::{CONN_DA, CommandMetadata};
@@ -23,8 +22,8 @@ pub enum ActiveSlot {
 impl From<ActiveSlot> for BootPartition {
     fn from(slot: ActiveSlot) -> Self {
         match slot {
-            ActiveSlot::A => BootPartition::A,
-            ActiveSlot::B => BootPartition::B,
+            ActiveSlot::A => Self::A,
+            ActiveSlot::B => Self::B,
         }
     }
 }
@@ -35,7 +34,7 @@ impl CommandMetadata for SetActiveSlotArgs {
     }
 
     fn about() -> &'static str {
-        "Set the active boot slot."
+        "Set the active boot slot for AB devices."
     }
 
     fn long_about() -> &'static str {
@@ -51,7 +50,7 @@ pub struct SetActiveSlotArgs {
 }
 
 impl DeviceCommand for SetActiveSlotArgs {
-    fn run(&self, dev: &mut Device, state: &mut PersistedDeviceState) -> Result<()> {
+    fn run<P: MtkPort>(&self, dev: &mut Device<P>, state: &mut PersistedDeviceState) -> Result<()> {
         dev.enter_da_mode()?;
 
         state.connection_type = CONN_DA;
@@ -71,9 +70,9 @@ impl DeviceCommand for SetActiveSlotArgs {
 
         let mut new_data = [0u8; OFFSET_SLOT_SUFFIX + size_of::<BootControl>()];
 
-        BootControl::serialize_into(&mut new_data[OFFSET_SLOT_SUFFIX..], &bootctrl)?;
+        bootctrl.try_write(&mut new_data[OFFSET_SLOT_SUFFIX..])?;
 
-        dev.download(&bootctrl.bctrl_part, new_data.len(), &new_data[..], |_, _| {})?;
+        dev.write_partition("misc", new_data.len(), &new_data[..], |_, _| {})?;
 
         info!("Active slot set to {:?}.", self.slot);
 

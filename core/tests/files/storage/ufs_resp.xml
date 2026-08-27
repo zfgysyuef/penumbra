@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<da_hw_info>
+	<version>1.2</version>
+	<ram_size>0x200000000</ram_size>
+	<battery_voltage>0</battery_voltage>
+	<random_id>50454e554d42524150454e554d425241</random_id>
+	<storage>UFS</storage>
+	<ufs>
+		<block_size>0x1000</block_size>
+		<lua0_size>0x400000</lua0_size>
+		<lua1_size>0x400000</lua1_size>
+		<lua2_size>0x3b96000000</lua2_size>
+		<lua3_size>0</lua3_size>
+		<ufs_vendor_id>0x1ce</ufs_vendor_id>
+		<ufs_cid>0000000000000000000000000000000000000000</ufs_cid>
+		<ufs_fwver>0000000000000000</ufs_fwver>
+	</ufs>
+	<product_id></product_id>
+</da_hw_info>

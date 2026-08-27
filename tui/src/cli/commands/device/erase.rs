@@ -6,7 +6,7 @@
 use anyhow::Result;
 use clap::Args;
 use log::info;
-use penumbra::Device;
+use penumbra::{Device, MtkPort};
 
 use crate::cli::DeviceCommand;
 use crate::cli::common::{CONN_DA, CommandMetadata};
@@ -34,13 +34,13 @@ impl CommandMetadata for EraseArgs {
 }
 
 impl DeviceCommand for EraseArgs {
-    fn run(&self, dev: &mut Device, state: &mut PersistedDeviceState) -> Result<()> {
+    fn run<P: MtkPort>(&self, dev: &mut Device<P>, state: &mut PersistedDeviceState) -> Result<()> {
         dev.enter_da_mode()?;
 
         state.connection_type = CONN_DA;
         state.flash_mode = 1;
 
-        let Some(part) = dev.dev_info.get_partition(&self.partition) else {
+        let Some(part) = dev.get_partition_active(&self.partition) else {
             return Err(anyhow::anyhow!("Partition '{}' not found on device.", self.partition));
         };
 
@@ -50,11 +50,11 @@ impl DeviceCommand for EraseArgs {
 
         info!("Erasing flash at address {:#X} with size {:#X}", part.address, part.size);
 
-        match dev.erase_partition(&self.partition, &mut progress_callback) {
+        match dev.erase_flash(&self.partition, &mut progress_callback) {
             Ok(_) => {}
             Err(e) => {
                 pb.abandon("Erase failed!");
-                return Err(e)?;
+                Err(e)?;
             }
         };
 

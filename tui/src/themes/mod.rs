@@ -4,10 +4,12 @@
 */
 use std::collections::HashMap;
 
-use ratatui::style::Color;
+use ratatui::style::{Color, Modifier, Style};
 
-// Themes
+mod catpuccin;
+mod froggy;
 mod gruvbox;
+mod penumbra;
 mod rose_pine;
 
 pub type ThemeConstructor = fn() -> Theme;
@@ -31,7 +33,7 @@ pub struct Theme {
 
 impl Default for Theme {
     fn default() -> Self {
-        Theme {
+        Self {
             name: "System",
             id: "system",
             is_dark: true,
@@ -49,6 +51,52 @@ impl Default for Theme {
     }
 }
 
+impl Theme {
+    pub fn style_accent(&self) -> Style {
+        Style::default().fg(self.accent)
+    }
+
+    pub fn style_accent_bold(&self) -> Style {
+        Style::default().fg(self.accent).add_modifier(Modifier::BOLD)
+    }
+
+    pub fn style_text(&self) -> Style {
+        Style::default().fg(self.text)
+    }
+
+    pub fn style_muted(&self) -> Style {
+        Style::default().fg(self.muted)
+    }
+
+    pub fn style_muted_bold(&self) -> Style {
+        Style::default().fg(self.muted).add_modifier(Modifier::BOLD)
+    }
+
+    pub fn style_title(&self) -> Style {
+        self.style_accent_bold()
+    }
+
+    pub fn style_label(&self, active: bool) -> Style {
+        if active { self.style_accent_bold() } else { self.style_text() }
+    }
+
+    pub fn style_description(&self) -> Style {
+        self.style_muted()
+    }
+
+    pub fn style_border(&self, active: bool) -> Style {
+        if active { self.style_accent() } else { self.style_muted() }
+    }
+
+    pub fn style_highlight(&self) -> Style {
+        Style::default().fg(self.accent).add_modifier(Modifier::BOLD)
+    }
+
+    pub fn style_info(&self) -> Style {
+        Style::default().fg(self.info).add_modifier(Modifier::ITALIC | Modifier::BOLD)
+    }
+}
+
 pub fn load_themes() -> ThemeRegistry {
     let mut themes: ThemeRegistry = HashMap::new();
 
@@ -56,6 +104,9 @@ pub fn load_themes() -> ThemeRegistry {
     themes.insert("rose_pine_moon", rose_pine::rose_pine_moon);
     themes.insert("gruvbox_light", gruvbox::gruvbox_light);
     themes.insert("gruvbox_dark", gruvbox::gruvbox_dark);
+    themes.insert("catppuccin_mocha", catpuccin::catppuccin_mocha);
+    themes.insert("penumbra", penumbra::penumbra);
+    themes.insert("froggy", froggy::froggy_dark);
 
     themes
 }

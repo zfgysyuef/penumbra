@@ -2,229 +2,227 @@
     SPDX-License-Identifier: AGPL-3.0-or-later
     SPDX-FileCopyrightText: 2025-2026 Shomy
 */
+use hacc::DaEntry;
+use log::{debug, info, warn};
 
-use log::{info, warn};
+use crate::Result;
+use crate::exploit::{DaEntryExt, get_v6_payload};
+use crate::utils::analysis::{Aarch64Analyzer, Analyzer, Arch, ArchAnalyzer, ArmAnalyzer};
+use crate::utils::hash::hash;
+use crate::utils::patching::*;
 
-use crate::da::{DA, DAEntryRegion, Xml};
-use crate::error::{Error, Result};
-use crate::exploit::get_v6_payload;
-use crate::utilities::analysis::{Arch, ArchAnalyzer, create_analyzer};
-use crate::utilities::arm::{encode_bl_arm, force_return as arm_force_return};
-use crate::utilities::arm64::{encode_bl as arm64_encode_bl, force_return as arm64_force_return};
-use crate::utilities::patching::*;
+const EXT_LOADER: &[u8] = include_bytes!("../../../payloads/extloader_v6.bin");
+const SLA_BYPASS: &[u8] = include_bytes!("../../../payloads/sla_xml.bin");
+const FORCE_RETURN_ARM64: &[u8] = &[0x00, 0x00, 0x80, 0xD2, 0xC0, 0x03, 0x5F, 0xD6]; // mov x0, #0; ret
+const FORCE_RETURN_ARM: &[u8] = &[0x00, 0x00, 0xA0, 0xE3, 0x1E, 0xFF, 0x2F, 0xE1]; // mov r0, #0; bx lr
 
-const EXTLOADER: &[u8] = include_bytes!("../../../payloads/extloader_v6.bin");
-
-pub const fn to_arch(is_arm64: bool) -> Arch {
-    if is_arm64 { Arch::Aarch64 } else { Arch::Arm }
+pub fn patch_da(da: &mut DaEntry) -> Result<()> {
+    patch_da2(da)?;
+    patch_da1(da)?;
+    Ok(())
 }
 
-pub fn patch_da(_xml: &mut Xml) -> Result<DA> {
-    todo!()
+pub fn patch_da1(da: &mut DaEntry) -> Result<()> {
+    let Some(hash_pos) = da.hash_offset() else {
+        warn!("Could not find DA1 hash position, skipping patching");
+        return Ok(());
+    };
+
+    let hash_type = da.get_hash_type();
+    let da2_code = da.da2_code();
+    let hash_result = hash(hash_type, da2_code);
+
+    debug!("New DA1 hash: {:X?}", hash_result);
+
+    let da1_data = da.da1_data_mut();
+
+    patch(da1_data, hash_pos, &hash_result)?;
+
+    Ok(())
 }
 
-pub fn patch_da1(_xml: &mut Xml) -> Result<DAEntryRegion> {
-    todo!()
+pub fn patch_da2(da: &mut DaEntry) -> Result<()> {
+    let da2_addr = da.da2().addr() as u64;
+    let da2_data = da.da2_data();
+
+    debug!("Patching DA2 with VA: 0x{:08X}", da2_addr);
+
+    let analyzer = match da.arch() {
+        Arch::Arm => Analyzer::Arm(ArmAnalyzer::new(da2_data.into(), da2_addr)),
+        Arch::Aarch64 => Analyzer::Aarch64(Aarch64Analyzer::new(da2_data.into(), da2_addr)),
+        Arch::Thumb2 => unreachable!(),
+    };
+
+    let da2_data = da.da2_data_mut();
+
+    patch_da_sla(da2_data, &analyzer)?;
+    patch_boot_to(da2_data, &analyzer)?;
+    patch_security(da2_data, &analyzer)?;
+
+    Ok(())
 }
 
-pub fn patch_da2(xml: &Xml) -> Result<DAEntryRegion> {
-    let mut da2 = xml
-        .da
-        .get_da2()
-        .cloned()
-        .ok_or_else(|| Error::penumbra("DA2 region not found for patching"))?;
-
-    let is_arm64 = xml.da.is_arm64();
-    let analyzer = create_analyzer(da2.data.clone(), da2.addr as u64, to_arch(is_arm64));
-
-    patch_security(&mut da2, analyzer.as_ref(), is_arm64, !xml.force_heapb8)?;
-    patch_boot_to(&mut da2, analyzer.as_ref(), is_arm64)?;
-
-    Ok(da2)
-}
-
-pub fn patch_boot_to(
-    da: &mut DAEntryRegion,
-    analyzer: &dyn ArchAnalyzer,
-    is_arm64: bool,
-) -> Result<bool> {
-    if find_pattern(&da.data, "434D443A424F4F542D544F00", 0) != HEX_NOT_FOUND {
+pub fn patch_boot_to(da: &mut [u8], analyzer: &Analyzer) -> Result<bool> {
+    if find_pattern(da, b"CMD:BOOT-TO", 0).is_some() {
         return Ok(true);
     }
 
-    let mut extloader = get_v6_payload(EXTLOADER, is_arm64).to_vec();
+    let is_arm64 = matches!(analyzer, Analyzer::Aarch64(_));
 
-    let Some(download_function_off) = analyzer.find_function_from_string("Download host file:%s")
-    else {
-        warn!("Could not find download function to patch Ext-Loader!");
-        return Ok(false);
-    };
+    let extloader = get_v6_payload(EXT_LOADER, is_arm64);
 
-    let payload_pointer = find_pattern(&extloader, "11111111", 0);
-    if payload_pointer == HEX_NOT_FOUND {
-        warn!("Could not prepare Ext-Loader!");
-        return Ok(false);
-    }
-
-    let download_addr: u32 = (download_function_off as u32) + da.addr;
-    patch(&mut extloader, payload_pointer, &bytes_to_hex(&download_addr.to_le_bytes()))?;
-
-    let Some(rsc_func_off) = analyzer.find_function_from_string("RSC file") else {
+    let Some(rsc_func_off) = analyzer.fn_from_str("RSC file") else {
         warn!("Could not find RSC function to inject Ext-Loader!");
         return Ok(false);
     };
 
-    patch(&mut da.data, rsc_func_off, &bytes_to_hex(&extloader))?;
-    patch_string(&mut da.data, "CMD:SET-RSC", "CMD:BOOT-TO");
+    debug!("Injecting Ext-Loader to DA2 at offset 0x{:X}", rsc_func_off);
+
+    patch(da, rsc_func_off, extloader)?;
+    patch_pattern_bytes(da, b"CMD:SET-RSC\0", b"CMD:BOOT-TO\0")?;
 
     info!("Injected Ext-Loader to DA2 successfully.");
     Ok(true)
 }
 
-fn patch_security(
-    da: &mut DAEntryRegion,
-    analyzer: &dyn ArchAnalyzer,
-    is_arm64: bool,
-    patch_sla_registration: bool,
-) -> Result<bool> {
-    patch_lock_state(da, analyzer, is_arm64)?;
-    patch_sec_policy(da, analyzer, is_arm64)?;
-    if patch_sla_registration {
-        patch_da_sla(da, analyzer, is_arm64)
-    } else {
-        // Forced HeapBait patches the live verifier and completes the dummy
-        // SLA handshake after DA2 starts. Preserve the original GET-DEV-FW
-        // registration so HeapBait can fetch the required device context.
-        info!("Preserving DA SLA command registration for forced HeapBait");
-        Ok(true)
-    }
-}
-
-fn patch_lock_state(
-    da: &mut DAEntryRegion,
-    analyzer: &dyn ArchAnalyzer,
-    is_arm64: bool,
-) -> Result<bool> {
-    let lks_patch: Vec<u8> = if is_arm64 {
-        #[rustfmt::skip]
-        let p = vec![
-            0x1F, 0x00, 0x00, 0xB9, // str xzr, [x0]
-            0x00, 0x00, 0x80, 0xD2, // mov x0, #0
-            0xC0, 0x03, 0x5F, 0xD6, // ret
-        ];
-        p
-    } else {
-        #[rustfmt::skip]
-        let p = vec![
-            0x00, 0x20, 0xA0, 0xE3, // mov r2, #0
-            0x04, 0x00, 0x80, 0xE8, // stmia r0, {r2}
-            0x00, 0x00, 0xA0, 0xE3, // mov r0, #0
-            0x1E, 0xFF, 0x2F, 0xE1, // bx lr
-        ];
-        p
-    };
-
-    let Some(off) = analyzer.find_function_from_string("[%s] sec_get_seccfg") else {
-        warn!("Could not patch lock state!");
-        return Ok(false);
-    };
-
-    patch(&mut da.data, off, &bytes_to_hex(&lks_patch))?;
-    info!("Patched DA2 to always report unlocked state.");
+fn patch_security(da: &mut [u8], analyzer: &Analyzer) -> Result<bool> {
+    patch_sec_policy(da, analyzer)?;
+    patch_sbc(da, analyzer)?;
     Ok(true)
 }
 
-fn patch_sec_policy(
-    da: &mut DAEntryRegion,
-    analyzer: &dyn ArchAnalyzer,
-    is_arm64: bool,
-) -> Result<bool> {
+fn patch_sec_policy(da: &mut [u8], analyzer: &Analyzer) -> Result<bool> {
     const POLICY_FUNC: &str = "==========security policy==========";
 
-    let Some(part_sec_pol_off) = analyzer.find_function_from_string(POLICY_FUNC) else {
-        warn!("Could not find security policy function!");
-        return Ok(false);
-    };
+    let get_policy = analyzer
+        .fn_from_str(POLICY_FUNC)
+        .and_then(|off| analyzer.next_bl_from_off(off))
+        .and_then(|off| analyzer.next_bl_from_off(off + 4))
+        .and_then(|bl| analyzer.bl_target_off(bl))
+        .and_then(|off| analyzer.next_bl_from_off(off))
+        .and_then(|off| analyzer.bl_target_off(off));
 
-    // BL policy_index
-    // BL hash_binding
-    // BL verify_policy
-    // BL download_policy
-    let Some(policy_idx_bl) = analyzer.get_next_bl_from_off(part_sec_pol_off) else {
-        warn!("Could not find policy_idx call");
+    if get_policy.is_none() {
+        warn!("Could not find get_policy function to patch!");
         return Ok(false);
-    };
-    let Some(hash_binding_bl) = analyzer.get_next_bl_from_off(policy_idx_bl + 4) else {
-        warn!("Could not find hash_binding call");
-        return Ok(false);
-    };
-    let Some(verify_bl) = analyzer.get_next_bl_from_off(hash_binding_bl + 4) else {
-        warn!("Could not find verify_policy call");
-        return Ok(false);
-    };
-    let Some(download_bl) = analyzer.get_next_bl_from_off(verify_bl + 4) else {
-        warn!("Could not find download_policy call");
-        return Ok(false);
-    };
-
-    let targets =
-        [(hash_binding_bl, "Hash Binding"), (verify_bl, "Verification"), (download_bl, "Download")];
-
-    let mut patched_any = false;
-
-    for (bl_offset, desc) in targets {
-        if let Some(func_offset) = analyzer.get_bl_target_offset(bl_offset) {
-            if is_arm64 {
-                arm64_force_return(&mut da.data, func_offset, 0)?;
-            } else {
-                arm_force_return(&mut da.data, func_offset, 0, false)?;
-            }
-            info!("Patched DA2 to skip security policy ({desc})");
-            patched_any = true;
-        } else {
-            warn!("Failed to resolve target for {desc}");
-        }
     }
 
-    if !patched_any {
-        warn!("Could not patch security policy!");
-    }
+    let return_zero = if matches!(analyzer, Analyzer::Aarch64(_)) {
+        FORCE_RETURN_ARM64
+    } else {
+        FORCE_RETURN_ARM
+    };
 
-    Ok(patched_any)
+    debug!("Patching get_policy function at offset 0x{:X}", get_policy.unwrap());
+
+    patch(da, get_policy.unwrap(), return_zero)?;
+
+    info!("Patched DA2 security policy!");
+
+    Ok(true)
 }
 
-fn patch_da_sla(
-    da: &mut DAEntryRegion,
-    analyzer: &dyn ArchAnalyzer,
-    is_arm64: bool,
-) -> Result<bool> {
-    let sla_str_offset = find_pattern(&da.data, "44412E534C4100454E41424C454400", 0);
-    if sla_str_offset == HEX_NOT_FOUND {
+fn patch_sbc(da: &mut [u8], analyzer: &Analyzer) -> Result<bool> {
+    const SBC_FUNC: &str = "[SBC] sbc_en = %d\n";
+
+    let get_sbc = analyzer
+        .fn_from_str(SBC_FUNC)
+        .and_then(|off| analyzer.next_bl_from_off(off))
+        .and_then(|off| analyzer.next_bl_from_off(off + 4))
+        .and_then(|off| analyzer.bl_target_off(off));
+
+    if get_sbc.is_none() {
+        warn!("Could not find SBC function to patch!");
+        return Ok(false);
+    }
+
+    let return_zero = if matches!(analyzer, Analyzer::Aarch64(_)) {
+        FORCE_RETURN_ARM64
+    } else {
+        FORCE_RETURN_ARM
+    };
+
+    debug!("Patching get_sbc function at offset 0x{:X}", get_sbc.unwrap());
+
+    patch(da, get_sbc.unwrap(), return_zero)?;
+
+    info!("Patched SBC to be disabled!");
+
+    Ok(true)
+}
+
+fn patch_da_sla(da: &mut [u8], analyzer: &Analyzer) -> Result<bool> {
+    const DOWNLOAD_MAGIC: u32 = 0x53434D44;
+    const CMDS_MAGIC: u32 = 0x53434D45;
+
+    if find_pattern(da, b"DA.SLA\0ENABLED", 0).is_none() {
         return Ok(true);
     }
 
-    let Some(register_all_cmds_off) = analyzer.find_function_from_string("CMD:REBOOT") else {
+    // Some Oplus DAs expose both the generic SEC-POLICY anchor and a
+    // vendor verifier. Patch the verifier independently; treating it only as
+    // a fallback leaves the target verifier active when the generic path succeeds.
+    let oplus_patched = patch_oplus_sla_verifier(da, analyzer)?;
+
+    let sla_func = analyzer.fn_from_str("SEC-POLICY");
+    let download_ptr =
+        analyzer.fn_from_str("Download host file:%s").and_then(|f| analyzer.off_to_va(f));
+    let reg_sec_cmds_ptr = analyzer.fn_from_str("CMD:REBOOT").and_then(|f| analyzer.off_to_va(f));
+
+    if sla_func.is_none() || download_ptr.is_none() || reg_sec_cmds_ptr.is_none() {
+        if oplus_patched {
+            return Ok(true);
+        }
+
         warn!("Could not patch DA SLA!");
         return Ok(false);
-    };
+    }
 
-    let Some(cmd_offset) = analyzer.find_string_xref("CMD:SECURITY-GET-DEV-FW-INFO") else {
-        warn!("Could not patch DA SLA!");
+    let sla_func = sla_func.unwrap();
+    let download_ptr = download_ptr.unwrap() as u32;
+    let reg_sec_cmds_ptr = reg_sec_cmds_ptr.unwrap() as u32;
+
+    debug!(
+        "Patching DA SLA at offset 0x{:X}, download_ptr: 0x{:X}, reg_sec_cmds_ptr: 0x{:X}",
+        sla_func, download_ptr, reg_sec_cmds_ptr
+    );
+
+    let is_64bit = matches!(analyzer, Analyzer::Aarch64(_));
+
+    let mut payload = get_v6_payload(SLA_BYPASS, is_64bit).to_vec();
+
+    patch_u32(&mut payload, DOWNLOAD_MAGIC, download_ptr)?;
+    patch_u32(&mut payload, CMDS_MAGIC, reg_sec_cmds_ptr)?;
+    patch(da, sla_func, &payload)?;
+
+    // Ensure a vendor verifier wins even if both analyzers resolve to an
+    // overlapping function range.
+    if oplus_patched {
+        patch_oplus_sla_verifier(da, analyzer)?;
+    }
+
+    info!("Patched DA SLA to accepy dummy auth.");
+
+    Ok(true)
+}
+
+fn patch_oplus_sla_verifier(da: &mut [u8], analyzer: &Analyzer) -> Result<bool> {
+    let verifier = analyzer
+        .fn_from_str("cust_security_verify_sec_policy")
+        .or_else(|| analyzer.fn_from_str("SLA EMSG Received.\n"));
+
+    let Some(verifier) = verifier else {
         return Ok(false);
     };
 
-    let Some(bl_to_patch_off) = analyzer.get_next_bl_from_off(cmd_offset) else {
-        warn!("Could not find BL instruction to patch for DA SLA!");
-        return Ok(false);
-    };
-
-    let bl_patch = if is_arm64 {
-        arm64_encode_bl(bl_to_patch_off as u32 + da.addr, register_all_cmds_off as u32 + da.addr)?
+    let return_zero = if matches!(analyzer, Analyzer::Aarch64(_)) {
+        FORCE_RETURN_ARM64
     } else {
-        encode_bl_arm(bl_to_patch_off as u32 + da.addr, register_all_cmds_off as u32 + da.addr)?
+        FORCE_RETURN_ARM
     };
 
-    patch(&mut da.data, bl_to_patch_off, &bytes_to_hex(&bl_patch.to_le_bytes()))?;
-    info!("Patched DA2 SLA to be disabled.");
+    debug!("Patching Oplus DA SLA verifier at offset 0x{:X}", verifier);
+    patch(da, verifier, return_zero)?;
+    info!("Patched Oplus DA SLA verifier to return success.");
     Ok(true)
 }

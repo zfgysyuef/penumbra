@@ -2,109 +2,135 @@
     SPDX-License-Identifier: AGPL-3.0-or-later
     SPDX-FileCopyrightText: 2025-2026 Shomy
 */
-
-use std::io::{Read, Write};
-
+use acon::{MMIO, SoC};
+#[cfg(feature = "exploits")]
+use hacc::LockState;
+use hacc::gfh::{GfhFile, GfhKind, GfhType};
+use hacc::{
+    BootControl,
+    BootControlError,
+    Da,
+    DaEntry,
+    DaVersion,
+    OFFSET_SLOT_SUFFIX,
+    Preloader,
+    TryRead,
+};
 use log::{info, warn};
 
-use crate::connection::Connection;
-use crate::connection::port::{ConnectionType, MTKPort};
-use crate::core::bootctrl::{BootControl, OFFSET_SLOT_SUFFIX};
-use crate::core::chip::{ChipInfo, chip_from_hw_code};
-use crate::core::devinfo::{DevInfoData, DeviceInfo};
-use crate::core::log_buffer::DeviceLog;
-use crate::core::seccfg::LockFlag;
-use crate::core::storage::{Partition, PartitionKind, RpmbRegion};
-use crate::da::protocol::{BootMode, DAProtocolParams};
-use crate::da::{DAFile, DAProtocol, DAType, DownloadProtocol, XFlash, Xml};
-use crate::error::{Error, Result};
+use crate::activity::DeviceActivity;
+#[cfg(feature = "exploits")]
+use crate::da::extensions::{KeyDeriveId, KeySize};
+use crate::da::*;
+use crate::devinfo::{DevInfo, DevInfoData};
+use crate::error::{ConnectionError, PenumbraError};
+use crate::log_buffer::DeviceLog;
+use crate::port::{ConnectionType, MtkPort};
+use crate::preloader::PlProtocol;
+use crate::storage::{PartitionKind, Storage};
+use crate::traits::{ProgressCallback, Reader, ReaderSource, Writer, WriterSink};
+use crate::{Error, Partition, Result, StorageKind, StorageType};
 
 /// A builder for creating a new [`Device`].
 ///
 /// This struct allows for configuring various parameters before constructing the device instance.
-/// You can optionally (but suggested) provide DA data to enable DA protocol support.
+/// You can optionally (mas recommended) provide DA data to enable DA protocol support.
 /// When no DA data is provided, only preloader commands will be available, limiting functionality.
-/// A MTKPort must be provided to build the device.
+/// A MtkPort must be provided to build the device.
 ///
 /// # Example
-/// ```ignore
-/// use penumbra::{Device, DeviceBuilder, find_mtk_port};
+/// ```no_run
+/// use penumbra_mtk::{Device, DeviceBuilder, port::{PortType, PortBackend}};
 ///
-/// let mtk_port = find_mtk_port().await.ok_or("No MTK port found")?;
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let vid = Some(0x0E8D);
+/// let pid = Some(0x2000);
+/// // Finds a Port filtered by VID and PID, and automatically selects the backend (USB, Serial or LibUsb)
+/// let port = PortType::find_device(vid, pid, PortBackend::Auto).expect("Port should open").ok_or("No MTK port found")?;
 /// let da_data = std::fs::read("path/to/da/file").expect("Failed to read DA file");
 /// let device =
-///     DeviceBuilder::default().with_mtk_port(your_mtk_port).with_da_data(your_da_data).build()?;
+///     DeviceBuilder::new(port).with_da_data(&da_data).build()?;
+///
+/// Ok(())
+/// # }
 /// ```
-#[derive(Default)]
-pub struct DeviceBuilder {
+pub struct DeviceBuilder<'a, P: MtkPort> {
     /// MTK port to use during connection. It can be either a serial port or a USB port.
     /// This field is required to build a Device.
-    mtk_port: Option<Box<dyn MTKPort>>,
+    mtk_port: P,
     /// DA data to use for the device. This field is optional, but recommended.
     /// If not provided, the device will not be able to use DA protocol, and instead
     /// Only preloader commands will be available.
-    da_data: Option<Vec<u8>>,
+    da_data: Option<&'a [u8]>,
     /// Preloader data to use for the device. This field is optional.
     /// If provided, it can be used to extract EMI settings or other information.
     /// Only needed if told to do so, like when the device is in BROM mode.
-    preloader_data: Option<Vec<u8>>,
+    preloader_data: Option<&'a [u8]>,
     /// Authentication data for DAA enabled devices. This field is optional.
     /// If the device has DAA enabled and is in BROM mode, this data will be
     /// sent during initialization to be able to load the DA.
-    auth_data: Option<Vec<u8>>,
+    auth_data: Option<&'a [u8]>,
     /// Whether to enable verbose logging.
-    verbose: bool,
+    da_log_level: DaLogLevel,
     /// Whether to use USB as the DA log channel instead of UART.
     /// When enabled, DA log messages are captured into a [`DeviceLog`] buffer
     /// instead of being sent over UART.
     usb_log_channel: bool,
-    /// Whether to force HeapB8/HeapBait instead of Carbonara on XML/V6 DAs.
-    force_heapb8: bool,
     /// A buffer to store DA log messages when `usb_log_channel` is enabled.
     /// This allows for capturing logs from devices without needing UART.
     device_log: Option<DeviceLog>,
+    /// Force HeapBait to run after Carbonara on XML/V6 DAs.
+    force_heapbait: bool,
+    /// Require a Preloader/BROM SLA challenge to succeed instead of allowing
+    /// exploit-enabled builds to defer the failure until DA upload.
+    require_brom_sla: bool,
+    activity: Option<DeviceActivity>,
 }
 
-impl DeviceBuilder {
+impl<'a, P: MtkPort> DeviceBuilder<'a, P> {
     /// Assigns the MTK port to be used for the device connection.
-    pub fn with_mtk_port(mut self, port: Box<dyn MTKPort>) -> Self {
-        self.mtk_port = Some(port);
-        self
+    pub const fn new(port: P) -> Self {
+        Self {
+            mtk_port: port,
+            da_data: None,
+            preloader_data: None,
+            auth_data: None,
+            da_log_level: DaLogLevel::Info,
+            usb_log_channel: false,
+            device_log: None,
+            force_heapbait: false,
+            require_brom_sla: false,
+            activity: None,
+        }
     }
 
     /// Assigns the DA data to be used for the device.
-    pub fn with_da_data(mut self, data: Vec<u8>) -> Self {
+    pub const fn with_da_data(mut self, data: &'a [u8]) -> Self {
         self.da_data = Some(data);
         self
     }
 
     /// Assigns the preloader data to be used for the device.
-    pub fn with_preloader(mut self, data: Vec<u8>) -> Self {
+    pub const fn with_preloader(mut self, data: &'a [u8]) -> Self {
         self.preloader_data = Some(data);
         self
     }
 
     /// Assigns the authentication data for DAA enabled devices.
-    pub fn with_auth(mut self, data: Vec<u8>) -> Self {
+    pub const fn with_auth(mut self, data: &'a [u8]) -> Self {
         self.auth_data = Some(data);
         self
     }
 
     /// Enables verbose logging mode.
-    pub const fn with_verbose(mut self, verbose: bool) -> Self {
-        self.verbose = verbose;
+    pub const fn with_log_level(mut self, level: DaLogLevel) -> Self {
+        self.da_log_level = level;
         self
     }
 
     /// Enable USB logging
     pub const fn with_usb_log_channel(mut self, enabled: bool) -> Self {
         self.usb_log_channel = enabled;
-        self
-    }
-
-    /// Force HeapB8/HeapBait instead of Carbonara on XML/V6 DAs.
-    pub const fn with_force_heapb8(mut self, force: bool) -> Self {
-        self.force_heapb8 = force;
         self
     }
 
@@ -117,525 +143,721 @@ impl DeviceBuilder {
         self
     }
 
+    /// Forces HeapBait to run even when Carbonara already reported success.
+    pub const fn with_force_heapbait(mut self, enabled: bool) -> Self {
+        self.force_heapbait = enabled;
+        self
+    }
+
+    /// Makes a Preloader/BROM SLA failure fatal during initialization.
+    pub const fn require_brom_sla(mut self, required: bool) -> Self {
+        self.require_brom_sla = required;
+        self
+    }
+
+    pub fn with_activity(mut self, activity: DeviceActivity) -> Self {
+        self.activity = Some(activity);
+        self
+    }
+
     /// Builds and returns a new `Device` instance.
-    pub fn build(self) -> Result<Device> {
-        let connection = self.mtk_port.map(Connection::new);
-
-        if connection.is_none() {
-            return Err(Error::penumbra("MTK port must be provided to build a Device."));
-        }
-
+    pub fn build(self) -> Result<Device<'a, P>> {
         let device_log = self.device_log.unwrap_or_default();
 
+        let da = match self.da_data {
+            Some(data) => Some(Da::try_read(data)?),
+            None => None,
+        };
+        let pl = match self.preloader_data {
+            Some(data) => Some(Preloader::try_read(data)?),
+            None => None,
+        };
+
         Ok(Device {
-            dev_info: DeviceInfo::default(),
-            connection,
+            da,
+            pl,
+            port: self.mtk_port,
+            da_log_level: self.da_log_level,
+            devinfo: DevInfo::default(),
             protocol: None,
             connected: false,
-            da_data: self.da_data,
-            preloader_data: self.preloader_data,
             auth_data: self.auth_data,
-            verbose: self.verbose,
             usb_log_channel: self.usb_log_channel,
-            force_heapb8: self.force_heapb8,
             device_log,
+            force_heapbait: self.force_heapbait,
+            require_brom_sla: self.require_brom_sla,
+            activity: self.activity.unwrap_or_default(),
         })
     }
 }
 
-/// Represents a connected MTK device.
-///
-/// This struct is the **main interface** for interacting with the device.
-/// It handles initialization, entering DA mode, reading/writing partitions,
-/// and accessing connection or protocol information.
-///
-/// # Lifecycle
-/// 1. Construct via [`DeviceBuilder`].
-/// 2. Call [`Device::init`] to handshake with the device.
-/// 3. Optionally call [`Device::enter_da_mode`] to switch to DA protocol.
-/// 4. Perform operations like `read_partition`, `write_partition`, etc.
-pub struct Device {
-    /// Device information and metadata, shared accross the whole crate.
-    pub dev_info: DeviceInfo,
-    /// Connection to the device via MTK port, null if DA protocol is used.
-    connection: Option<Connection>,
-    /// DA protocol handler, null if only preloader commands are used.
-    protocol: Option<DAProtocol>,
-    /// Whether the device is connected and initialized.
-    connected: bool,
-    /// Raw DA file data, if provided.
-    da_data: Option<Vec<u8>>,
-    /// Preloader data, if provided.
-    preloader_data: Option<Vec<u8>>,
-    /// Auth file data for DAA enabled devices, if provided.
-    auth_data: Option<Vec<u8>>,
-    /// Whether verbose logging is enabled.
-    verbose: bool,
-    /// Whether to log DA messages over USB.
+pub struct Device<'a, P: MtkPort> {
+    port: P,
+    da: Option<Da<'a>>,
+    pl: Option<Preloader<'a>>,
+    auth_data: Option<&'a [u8]>,
+    devinfo: DevInfo,
+    da_log_level: DaLogLevel,
     usb_log_channel: bool,
-    /// Whether to force HeapB8/HeapBait instead of Carbonara on XML/V6 DAs.
-    force_heapb8: bool,
-    /// Buffer to store DA log messages.
     device_log: DeviceLog,
+    force_heapbait: bool,
+    require_brom_sla: bool,
+    activity: DeviceActivity,
+    protocol: Option<DaProtocol<'a>>,
+    connected: bool,
 }
 
-impl Device {
-    /// Initializes the device by performing handshake and retrieving device information.
-    /// This must be called before any other operations.
+impl<'a, P: MtkPort> Device<'a, P> {
+    fn ensure_rpmb_region_supported(&mut self, region: crate::storage::RpmbRegion) -> Result<()> {
+        let storage = self.get_storage().ok_or(PenumbraError::UnsupportedStorage)?;
+        if storage.kind() != StorageType::Ufs && region != crate::storage::RpmbRegion::R0 {
+            return Err(PenumbraError::InvalidRpmbRegion.into());
+        }
+        Ok(())
+    }
+
+    /// Initializes the device by performing the initial handshake with Preloader/BROM and
+    /// retrieving device information.
     ///
-    /// # Examples
-    /// ```ignore
-    /// use penumbra::{DeviceBuilder, find_mtk_port};
+    /// If the device has DAA enabled, the provided auth file will be sent to the device to allow
+    /// loading the DA.
+    /// If the device has SLA enabled, the SLA challenge will be performed using the public key from
+    /// the auth file.
     ///
-    /// let mtk_port = find_mtk_port().ok_or("No MTK port found")?;
-    /// let mut device = DeviceBuilder::default().with_mtk_port(mtk_port).build()?;
+    /// # Example
+    /// ```no_run
+    /// use penumbra_mtk::DeviceBuilder;
+    /// use penumbra_mtk::port::{PortBackend, PortType};
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let vid = Some(0x0E8D);
+    /// let pid = Some(0x2000);
+    ///
+    /// let auth_file = std::fs::read("path/to/auth/file").expect("Failed to read auth file");
+    /// let mtk_port = PortType::find_device(vid, pid, PortBackend::Auto)
+    ///     .expect("Port should open")
+    ///     .ok_or("No MTK port found")?;
+    /// let da_data = std::fs::read("path/to/da/file").expect("Failed to read DA file");
+    ///
+    /// let mut device =
+    ///     DeviceBuilder::new(mtk_port).with_da_data(&da_data).with_auth(&auth_file).build()?;
     ///
     /// device.init()?;
-    /// assert_eq!(device.connected, true);
+    ///
+    /// Ok(())
+    /// # }
     /// ```
     pub fn init(&mut self) -> Result<()> {
-        self.init_inner(None)
-    }
+        let conn_type = self.port().connection_type();
+        let require_brom_sla = self.require_brom_sla;
 
-    /// Initializes the device and completes the Preloader/BROM one-time SLA
-    /// challenge before attempting any protected command.
-    ///
-    /// `signer` receives the device-specific BLOB and must return its raw
-    /// signature. The challenge is valid only for the current connection.
-    pub fn init_with_brom_sla<F>(&mut self, mut signer: F) -> Result<()>
-    where
-        F: FnMut(&[u8]) -> Result<Vec<u8>>,
-    {
-        self.init_inner(Some(&mut signer))
-    }
-
-    fn init_inner(
-        &mut self,
-        brom_sla_signer: Option<&mut dyn FnMut(&[u8]) -> Result<Vec<u8>>>,
-    ) -> Result<()> {
-        let mut conn = self
-            .connection
-            .take()
-            .ok_or_else(|| Error::penumbra("Connection is not initialized."))?;
-
-        conn.handshake()?;
-
-        if brom_sla_signer.is_some() && conn.connection_type == ConnectionType::Da {
-            return Err(Error::penumbra(
-                "Preloader/BROM MI authentication cannot run after the device has entered DA mode",
-            ));
+        if require_brom_sla && conn_type != ConnectionType::Brom {
+            return Err(PenumbraError::BromSlaRequired.into());
+        }
+        if require_brom_sla && self.auth_data.is_none() {
+            return Err(PenumbraError::InvalidAuthFile.into());
         }
 
-        let hw_code = conn.get_hw_code()?;
-        let mut soc_id = conn.get_soc_id()?;
-        let mut target_config = conn.get_target_config()?;
+        let mut pl = PlProtocol::new(&mut self.port);
 
-        // SP Flash Tool performs standard tool authentication before asking
-        // BROM for the one-time SLA challenge. Requesting command 0xE3 first
-        // makes Xiaomi BROM return 0x7017 (tool auth is null).
-        if target_config & 0x6 != 0 && conn.connection_type == ConnectionType::Brom {
-            if let Some(auth) = &self.auth_data {
-                conn.send_auth(auth)?;
-            } else if brom_sla_signer.is_some() {
-                return Err(Error::penumbra(
-                    "BROM SLA/DAA security is enabled; --mi-auth requires a matching --auth file before the one-time challenge can be requested",
-                ));
-            }
-        }
+        pl.handshake()?;
 
-        if let Some(signer) = brom_sla_signer {
-            // Match SP Flash Tool by refreshing security state after the AUTH
-            // file was accepted. Only request a BLOB if SLA remains enabled.
-            target_config = conn.get_target_config()?;
-            if target_config & 0x2 != 0 {
-                soc_id = conn.get_soc_id()?;
-                info!("Requesting the one-time Preloader/BROM MI authentication challenge...");
-                conn.complete_brom_sla(&soc_id, signer)?;
-            } else {
-                info!("BROM SLA is no longer enabled after AUTH; no one-time challenge is needed");
-            }
-        }
+        // TODO: Return a target config struct instead.
+        let target_config = pl.get_target_config()?;
+        let hw_code = pl.get_hw_code()?;
+        let (hw_subcode, ..) = pl.get_hw_sw_ver()?;
+        // Some old devices don't support this command.
+        let soc_id = pl.get_soc_id().unwrap_or_default();
+        // MTK removed MEID on newer preloaders.
+        let meid = pl.get_meid().unwrap_or_default();
 
-        // Some stock preloaders gate MEID and other commands until AUTH/SLA
-        // succeeds, so retrieve it only after the security flow.
-        let meid = conn.get_meid()?;
+        // Might look redundant, but most devices can work even without knowing
+        // the SoC. While we prefer to know, it's better to allow the device to work
+        // in stock mode than failing. Features like extensions or some exploits will fail,
+        // but that's expected.
+        let chip = SoC::try_from_hwcode(hw_code).map_or_else(
+            || {
+                warn!("Unknown hardware code 0x{:04X}.", hw_code);
+                warn!("Please report this hw code to the developers.");
+                warn!("Some features may not work correctly on this device.");
+                None
+            },
+            Some,
+        );
 
-        let device_info = DevInfoData {
+        let devinfo = DevInfoData {
             soc_id,
             meid,
-            hw_code,
             partitions: vec![],
-            target_config,
+            chip,
             bootctrl: None,
+            hw_code,
+            hw_subcode,
+            target_config,
         };
 
-        self.dev_info.set_data(device_info);
-        let chip = chip_from_hw_code(hw_code);
-        if chip.hw_code() == 0x0000 {
-            warn!("Unknown hardware code 0x{:04X}. Device might not work as expected.", hw_code);
-            warn!("If you think this is incorrect, please report this hw code to the developers.");
+        let devinfo = DevInfo::new(devinfo);
+
+        if (devinfo.sla_enabled() || devinfo.daa_enabled())
+            && conn_type == ConnectionType::Brom
+            && let Some(auth) = &self.auth_data
+        {
+            if conn_type == ConnectionType::Brom {
+                pl.send_auth(auth)?;
+            }
+
+            if devinfo.sla_enabled() {
+                let file = GfhFile::try_read(auth)?;
+
+                let Some(GfhKind::ToolAuth(tool_auth)) = file.get_gfh(GfhType::ToolAuth) else {
+                    return Err(PenumbraError::InvalidAuthFile.into());
+                };
+
+                let sla_pubk: &[u8] = tool_auth.sla_public_key.n_key();
+
+                // If we have exploits enabled, we can ignore the result of the SLA challenge since
+                // we can bypass it in some cases, and if the latter fails, we can't continue
+                // anyway and we'll get an error about SLA during DA upload.
+                #[cfg(feature = "exploits")]
+                if require_brom_sla {
+                    pl.sla_challenge(sla_pubk)?;
+                } else if conn_type == ConnectionType::Brom {
+                    pl.sla_challenge(sla_pubk).ok();
+                }
+                #[cfg(not(feature = "exploits"))]
+                if conn_type == ConnectionType::Brom || require_brom_sla {
+                    pl.sla_challenge(sla_pubk)?;
+                }
+            }
         }
 
-        self.dev_info.set_chip(chip);
-
-        if self.da_data.is_some() {
-            self.protocol = Some(self.init_da_protocol(conn)?);
-        } else {
-            self.connection = Some(conn);
-        }
+        self.devinfo = devinfo;
 
         self.connected = true;
 
         Ok(())
     }
 
-    /// Reinits the device connection based on the current connection type and optional DA info.
-    /// This is useful for CLIs or scenarios where the Device instance needs to be reset.
-    pub fn reinit(&mut self, dev_info: DevInfoData) -> Result<()> {
-        let mut conn = self
-            .connection
-            .take()
-            .ok_or_else(|| Error::penumbra("Connection is not initialized."))?;
-
-        self.dev_info.set_data(dev_info);
-        self.dev_info.set_chip(chip_from_hw_code(self.dev_info.hw_code()));
-
-        match conn.connection_type {
-            ConnectionType::Preloader | ConnectionType::Brom => {
-                // If we already are in preloader/brom mode, just handshake again
-                conn.handshake()?;
-                self.connection = Some(conn);
-            }
-            ConnectionType::Da => {
-                self.protocol = Some(self.init_da_protocol(conn)?);
-            }
-        };
-
-        self.connected = true;
-
-        Ok(())
-    }
-
-    /// Enters DA mode by uploading the DA to the device.
-    /// This is required for performing DA protocol operations.
-    /// After entering DA mode, the device's partition information is read and stored in `dev_info`.
+    /// Re-initialises the device connection using a previously gathered `DevInfoData`.
+    /// Useful for resuming a session without repeating the full handshake.
     ///
     /// # Examples
-    /// ```ignore
-    /// use penumbra::{DeviceBuilder, find_mtk_port};
+    /// ```no_run
+    /// # use penumbra_mtk::{DeviceBuilder, port::{PortType, PortBackend}};
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let mtk_port = PortType::find_device(None, None, PortBackend::Auto).unwrap().unwrap();
+    /// # let mut device = DeviceBuilder::new(mtk_port).build()?;
+    /// # device.init()?;
+    /// let devinfo_data = device.devinfo().data();
+    /// device.reinit(devinfo_data)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn reinit(&mut self, dev_info: DevInfoData) -> Result<()> {
+        self.devinfo = DevInfo::new(dev_info);
+
+        match self.port().connection_type() {
+            ConnectionType::Preloader | ConnectionType::Brom => {
+                let mut pl = PlProtocol::new(self.port_mut());
+                pl.handshake()?;
+            }
+            ConnectionType::Da => {
+                let protocol = self.init_da_protocol()?;
+                self.protocol = Some(protocol);
+            }
+        };
+
+        self.connected = true;
+
+        Ok(())
+    }
+
+    /// Returns a reference to the underlying MTK port.
+    pub const fn port(&self) -> &P {
+        &self.port
+    }
+
+    /// Returns a mutable reference to the underlying MTK port.
+    pub const fn port_mut(&mut self) -> &mut P {
+        &mut self.port
+    }
+
+    /// Returns the current connection type for the port.
+    pub fn get_connection_type(&self) -> ConnectionType {
+        self.port().connection_type()
+    }
+
+    /// Sets the current connection type for the port.
+    /// Use this before `reinit` or it might cause issues with the protocol initialization.
     ///
-    /// let mtk_port = find_mtk_port().ok_or("No MTK port found")?;
-    /// let da_data = std::fs::read("path/to/da/file").expect("Failed to read DA file");
-    /// let mut device =
-    ///     DeviceBuilder::default().with_mtk_port(mtk_port).with_da_data(da_data).build()?;
+    /// # Examples
+    /// ```no_run
+    /// # use penumbra_mtk::{DeviceBuilder, port::{PortType, PortBackend, ConnectionType}};
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let mtk_port = PortType::find_device(None, None, PortBackend::Auto).unwrap().unwrap();
+    /// # let mut device = DeviceBuilder::new(mtk_port).build()?;
+    /// # device.init()?;
+    /// device.set_connection_type(ConnectionType::Da)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn set_connection_type(&mut self, conn_type: ConnectionType) -> Result<()> {
+        self.port_mut().set_connection_type(conn_type)
+    }
+
+    /// Uploads the provided Download Agent to the device and switches the connection type to DA
+    /// mode.
+    /// If the device is already in DA mode, this function will do nothing.
+    /// If no DA file was provided during device creation, this function will return an error.
     ///
-    /// device.init()?;
+    /// # Examples
+    /// ```no_run
+    /// # use penumbra_mtk::{DeviceBuilder, port::{PortType, PortBackend, ConnectionType}};
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let mtk_port = PortType::find_device(None, None, PortBackend::Auto).unwrap().unwrap();
+    /// # let mut device = DeviceBuilder::new(mtk_port).build()?;
+    /// # device.init()?;
     /// device.enter_da_mode()?;
+    /// assert_eq!(device.get_connection_type(), ConnectionType::Da);
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn enter_da_mode(&mut self) -> Result<()> {
         if !self.connected {
-            return Err(Error::conn("Device is not connected. Call init() first."));
+            return Err(ConnectionError::PortNotOpen.into());
         }
 
-        let conn_type = self.get_connection()?.connection_type;
+        let mut proto = self.init_da_protocol()?;
 
-        if self.protocol.is_none() {
-            let conn =
-                self.connection.take().ok_or_else(|| Error::conn("No connection available."))?;
-            let protocol = self.init_da_protocol(conn)?;
-            self.protocol = Some(protocol);
-        }
+        let mut da = Self::get_da_entry(self.da.as_ref(), self.devinfo())?;
 
-        let protocol = self.protocol.as_mut().unwrap();
-        if conn_type != ConnectionType::Da {
-            protocol.upload_da()?;
+        if self.get_connection_type() != ConnectionType::Da {
+            proto.upload_da(&mut self.port, &mut da)?;
             self.set_connection_type(ConnectionType::Da)?;
         }
 
-        // Fallback to ensure we always have the partitions available.
-        self.get_partitions();
-        // Bootctrl may fail, but we don't really care since
-        // not all devices support it.
+        self.protocol = Some(proto);
+
+        self.partitions();
         self.get_bootctrl().ok();
+
         Ok(())
     }
 
-    /// Internal helper to ensure the device enters DA mode before performing DA operations.
-    fn ensure_da_mode(&mut self) -> Result<&mut DAProtocol> {
-        if !self.connected {
-            return Err(Error::conn("Device is not connected. Call init() first."));
-        }
+    fn get_da_entry<'da>(da: Option<&'da Da<'da>>, devinfo: &DevInfo) -> Result<DaEntry<'da>> {
+        let hw_code = devinfo.chip().map_or_else(|| devinfo.hw_code(), |c| c.to_dacode());
+        let hw_subcode = devinfo.hw_subcode();
 
-        if self.protocol.is_none() {
-            return Err(Error::conn("DA protocol is not initialized. DA data might be missing."));
-        }
+        let entry = da
+            .ok_or(PenumbraError::DaNotProvided)?
+            .entries()
+            .find(|entry| entry.hw_code() == hw_code && entry.hw_sub_code() == hw_subcode)
+            .ok_or(PenumbraError::NoCompatibleDa(hw_code, hw_subcode))?;
 
-        if self.get_connection()?.connection_type != ConnectionType::Da {
-            info!("Not in DA mode, entering now...");
-            self.enter_da_mode()?;
-        }
-
-        Ok(self.get_protocol().unwrap())
+        Ok(entry)
     }
 
-    fn init_da_protocol(&mut self, conn: Connection) -> Result<DAProtocol> {
-        let da_bytes = self.da_data.clone().ok_or_else(|| {
-            Error::conn("DA protocol is not initialized and no DA file was provided.")
-        })?;
+    fn init_da_protocol(&mut self) -> Result<DaProtocol<'a>> {
+        let da_entry = Self::get_da_entry(self.da.as_ref(), self.devinfo())?;
 
-        let da_file = DAFile::parse_da(&da_bytes)?;
-        let hw_code = self.dev_info.hw_code();
-        let da = da_file.get_da_from_hw_code(hw_code).ok_or_else(|| {
-            Error::penumbra(format!("No compatible DA for hardware code 0x{:04X}", hw_code))
-        })?;
+        let da_type = da_entry.version();
 
-        let da_type = da.da_type;
-
-        if self.force_heapb8 {
-            #[cfg(feature = "no_exploits")]
-            {
-                return Err(Error::penumbra(
-                    "--force-heapb8 requires exploit support, but penumbra was built with no_exploits",
-                ));
-            }
-
-            #[cfg(not(feature = "no_exploits"))]
-            if da_type != DAType::V6 {
-                return Err(Error::penumbra("--force-heapb8 only supports XML/V6 Download Agents"));
-            }
-        }
-
-        let params = DAProtocolParams {
-            da,
-            devinfo: self.dev_info.clone(),
+        let params = DaProtocolParams {
+            devinfo: self.devinfo.clone(),
             device_log: self.device_log.clone(),
-            verbose: self.verbose,
+            activity: self.activity.clone(),
+            log_level: self.da_log_level,
             usb_log_channel: self.usb_log_channel,
-            force_heapb8: self.force_heapb8,
-            preloader: self.preloader_data.clone(),
+            force_heapbait: self.force_heapbait,
+            preloader: self.pl.take(),
         };
 
-        let protocol: DAProtocol = match da_type {
-            DAType::V5 => DAProtocol::V5(XFlash::new(conn, params)),
-            DAType::V6 => DAProtocol::V6(Xml::new(conn, params)),
-            _ => return Err(Error::penumbra("Unsupported DA type")),
+        let protocol = match da_type {
+            DaVersion::V5 => DaProtocol::V5(XFlash::new(params)),
+            DaVersion::V6 => DaProtocol::V6(Xml::new(params)),
+            DaVersion::V3 => return Err(PenumbraError::UnsupportedDevice.into()),
         };
 
-        self.get_partitions();
-        self.get_bootctrl().ok();
         Ok(protocol)
     }
 
-    /// Returns the resolved [`ChipInfo`] for this device.
-    pub fn chip(&self) -> &'static ChipInfo {
-        self.dev_info.chip()
-    }
-
-    /// Returns a reference to the device log buffer
-    pub const fn device_log(&self) -> &DeviceLog {
-        &self.device_log
-    }
-
-    /// Gets a mutable reference to the active connection.
-    /// If the device is in DA mode, it retrieves the connection from the DA protocol.
-    pub fn get_connection(&mut self) -> Result<&mut Connection> {
-        match (&mut self.connection, &mut self.protocol) {
-            (Some(conn), _) => Ok(conn),
-            (None, Some(proto)) => Ok(proto.get_connection()),
-            (None, None) => Err(Error::conn("No active connection available.")),
+    /// Guarantees the device is in DA mode. If it is not currently in DA mode,
+    /// it will automatically invoke `enter_da_mode()`.
+    ///
+    /// # Examples
+    /// ```no_run
+    /// # use penumbra_mtk::{DeviceBuilder, port::{PortType, PortBackend, ConnectionType}};
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let mtk_port = PortType::find_device(None, None, PortBackend::Auto).unwrap().unwrap();
+    /// # let mut device = DeviceBuilder::new(mtk_port).build()?;
+    /// # device.init()?;
+    /// device.ensure_da_mode()?;
+    /// assert_eq!(device.get_connection_type(), ConnectionType::Da);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn ensure_da_mode(&mut self) -> Result<()> {
+        if !self.connected {
+            return Err(ConnectionError::PortNotOpen.into());
         }
+
+        if self.protocol.is_some() && self.get_connection_type() == ConnectionType::Da {
+            return Ok(());
+        }
+
+        self.enter_da_mode()
     }
 
-    /// Sets the connection type of the active connection.
-    /// Note that this does not change the actual connection state, only the type metadata.
-    /// This is mainly used for reinitialization after entering DA mode.
-    pub fn set_connection_type(&mut self, conn_type: ConnectionType) -> Result<()> {
-        let conn = self.get_connection()?;
-        conn.connection_type = conn_type;
-        Ok(())
-    }
-
-    /// Gets a mutable reference to the DA protocol handler, if available.
-    /// Returns `None` if the device is not in DA mode.
-    pub const fn get_protocol(&mut self) -> Option<&mut DAProtocol> {
+    /// Returns a mutable reference to the initialized DA protocol, if available.
+    pub const fn get_protocol(&mut self) -> Option<&mut DaProtocol<'a>> {
         self.protocol.as_mut()
     }
 
-    /// Retrieves the list of partitions from the device.
-    /// If partitions have already been fetched, returns the cached list.
-    /// Otherwise, queries the DA protocol for partition information and caches the result.
-    ///
-    /// Returns an empty list if no DA protocol is available.
+    /// Provides scoped access to both the DA protocol and the MtkPort simultaneously.
+    /// Useful when requiring direct access to protocol specific commands that are not
+    /// exposed in the `DaProtocol` abstraction.
     ///
     /// # Examples
-    /// ```ignore
-    /// use penumbra::{DeviceBuilder, find_mtk_port};
+    /// ```no_run
+    /// # use penumbra_mtk::{DeviceBuilder, port::{PortType, PortBackend}};
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let mtk_port = PortType::find_device(None, None, PortBackend::Auto).unwrap().unwrap();
+    /// # let mut device = DeviceBuilder::new(mtk_port).build()?;
+    /// # device.init()?;
+    /// use penumbra_mtk::da::DaProtocol;
+    /// use penumbra_mtk::da::xflash::set_rsc_info;
+    /// device.with_protocol(|proto, port| {
+    ///     let DaProtocol::V5(xflash) = proto else {
+    ///         return Err(penumbra_mtk::error::PenumbraError::WrongProtocolVersion.into());
+    ///     };
     ///
-    /// let mtk_port = find_mtk_port().ok_or("No MTK port found")?;
-    /// let da_data = std::fs::read("path/to/da/file").expect("Failed to read DA file");
-    /// let mut device =
-    ///     DeviceBuilder::default().with_mtk_port(mtk_port).with_da_data(da_data).build()?;
+    ///     let file = std::fs::File::open("path/to/rsc/file").expect("Failed to open RSC file");
+    ///     let file_size = std::fs::metadata("path/to/rsc/file")
+    ///         .expect("Failed to get RSC file metadata")
+    ///         .len() as usize;
+    ///     let mut reader = std::io::BufReader::new(file);
+    ///     let mut progress = |written: usize, total: usize| {
+    ///         println!("Written: {}/{}", written, total);
+    ///     };
     ///
-    /// device.init()?;
-    /// device.enter_da_mode()?;
-    /// let partitions = device.get_partitions();
-    /// for part in &partitions {
-    ///     println!("{}: size={}", part.name, part.size);
-    /// }
+    ///     set_rsc_info(xflash, port, "lk", file_size, &mut reader, &mut progress)?;
+    ///     Ok(())
+    /// })?;
+    /// # Ok(())
+    /// # }
     /// ```
-    pub fn get_partitions(&mut self) -> Vec<Partition> {
-        let cached = self.dev_info.partitions();
-        if !cached.is_empty() {
-            return cached;
-        }
+    pub fn with_protocol<F, R>(&mut self, f: F) -> Result<R>
+    where
+        F: FnOnce(&mut DaProtocol<'a>, &mut P) -> Result<R>,
+    {
+        let port = &mut self.port;
+        let proto = self.protocol.as_mut().ok_or(PenumbraError::ProtocolNotInitialized)?;
 
-        let protocol = match self.get_protocol() {
-            Some(p) => p,
-            None => return Vec::new(),
-        };
-
-        info!("Retrieving partition information...");
-        let partitions = protocol.get_partitions();
-
-        self.dev_info.set_partitions(partitions.clone());
-
-        partitions
+        f(proto, port)
     }
 
+    /// Retrieves info about the device storage.
+    pub fn get_storage(&mut self) -> Option<StorageKind> {
+        self.ensure_da_mode().ok()?;
+
+        let protocol = self.protocol.as_mut().unwrap();
+        protocol.get_storage(&mut self.port).cloned()
+    }
+
+    /// Returns a reference to the DevInfo struct, containing information about
+    /// the chip, efuses and more, fetched during the device life cycle.
+    pub const fn devinfo(&self) -> &DevInfo {
+        &self.devinfo
+    }
+
+    /// Returns an iterator over the device's partitions.
+    /// If the partition table has not been read yet, it will fetch it from the device first.
+    ///
+    /// # Examples
+    /// ```no_run
+    /// # use penumbra_mtk::{DeviceBuilder, port::{PortType, PortBackend}};
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let mtk_port = PortType::find_device(None, None, PortBackend::Auto).unwrap().unwrap();
+    /// # let mut device = DeviceBuilder::new(mtk_port).build()?;
+    /// # device.init()?;
+    /// for partition in device.partitions_iter() {
+    ///     println!("Found partition: {}", partition.name);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn partitions_iter(&mut self) -> impl Iterator<Item = Partition> {
+        if self.devinfo.partitions().is_empty()
+            && let Some(protocol) = self.protocol.as_mut()
+        {
+            info!("Retrieving partition information...");
+            let parts: Vec<Partition> = protocol.partitions(&mut self.port).collect();
+            self.devinfo.set_partitions(parts);
+        }
+
+        self.devinfo.partitions().into_iter()
+    }
+
+    /// Returns a `Vec` containing all the device's partitions.
+    /// Will automatically fetch the partition table from the device if not already cached.
+    ///
+    /// # Examples
+    /// ```no_run
+    /// # use penumbra_mtk::{DeviceBuilder, port::{PortType, PortBackend}};
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let mtk_port = PortType::find_device(None, None, PortBackend::Auto).unwrap().unwrap();
+    /// # let mut device = DeviceBuilder::new(mtk_port).build()?;
+    /// # device.init()?;
+    /// let parts = device.partitions();
+    /// println!("Device has {} partitions", parts.len());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn partitions(&mut self) -> Vec<Partition> {
+        self.partitions_iter().collect()
+    }
+
+    /// Returns a particular partition by name, if it exists.
+    /// Will automatically fetch the partition table from the device if not already cached.
+    ///
+    /// # Examples
+    /// ```no_run
+    /// # use penumbra_mtk::{DeviceBuilder, port::{PortType, PortBackend}};
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let mtk_port = PortType::find_device(None, None, PortBackend::Auto).unwrap().unwrap();
+    /// # let mut device = DeviceBuilder::new(mtk_port).build()?;
+    /// # device.init()?;
+    /// let part = device.get_partition("lk_a");
+    /// assert!(part.is_some());
+    ///
+    /// println!("Lk partition size: {}", part.unwrap().size);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn get_partition(&mut self, name: &str) -> Option<Partition> {
+        self.partitions_iter().find(|p| p.name == name)
+    }
+
+    /// Returns a particular partition by name, if it exists, while being aware of the device active
+    /// slot. Will automatically fetch the partition table from the device if not already
+    /// cached.
+    ///
+    /// # Examples
+    /// ```no_run
+    /// # use penumbra_mtk::{DeviceBuilder, port::{PortType, PortBackend}};
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let mtk_port = PortType::find_device(None, None, PortBackend::Auto).unwrap().unwrap();
+    /// # let mut device = DeviceBuilder::new(mtk_port).build()?;
+    /// # device.init()?;
+    /// // If device is in slot A, this will return the partition for "lk_a", otherwise "lk_b"
+    /// let part = device.get_partition_active("lk");
+    /// assert!(part.is_some());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn get_partition_active(&mut self, name: &str) -> Option<Partition> {
+        // Ensure the partition table is loaded and cached
+        self.partitions();
+
+        if self.devinfo().bootctrl().is_none() {
+            self.get_bootctrl().ok();
+        }
+
+        self.devinfo.get_partition(name)
+    }
+
+    /// Retrieves and parses the Boot Control partition
+    /// It generally searches for the `misc` or `para` partition to read the slot status.
+    ///
+    /// # Examples
+    /// ```no_run
+    /// # use penumbra_mtk::{DeviceBuilder, port::{PortType, PortBackend}};
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let mtk_port = PortType::find_device(None, None, PortBackend::Auto).unwrap().unwrap();
+    /// # let mut device = DeviceBuilder::new(mtk_port).build()?;
+    /// # device.init()?;
+    /// let boot_ctrl = device.get_bootctrl()?;
+    /// println!("Active slot: {:?}", boot_ctrl.get_active_slot());
+    /// # Ok(())
+    /// # }
     pub fn get_bootctrl(&mut self) -> Result<BootControl> {
-        if let Some(cached) = self.dev_info.get_bootctrl() {
+        if let Some(cached) = self.devinfo.bootctrl() {
             return Ok(cached);
         }
 
-        let parts = self.get_partitions();
-        let target_parts: Vec<&str> = ["misc", "para"]
-            .iter()
-            .filter_map(|&name| parts.iter().find(|p| p.name == name).map(|p| p.name.as_str()))
-            .collect();
+        let target_partition =
+            self.partitions_iter().find(|p| p.name == "misc" || p.name == "para").map(|p| p.name);
 
-        if target_parts.is_empty() {
-            return Err(Error::penumbra("Neither 'misc' nor 'para' partition found."));
-        }
+        let Some(part_name) = target_partition else {
+            return Err(PenumbraError::PartitionNotFound("misc or para".into()).into());
+        };
 
         let mut buffer = Vec::new();
-        for part in target_parts {
-            buffer.clear();
 
-            if self.upload(part, &mut buffer, |_, _| {}).is_err() {
-                continue;
-            }
+        // We need to use protocol to read the partition, or we will enter a loop of reading the
+        // partition and trying to get boot control again.
+        let proto = self.protocol.as_mut().ok_or(PenumbraError::ProtocolNotInitialized)?;
+        proto.read_partition(&mut self.port, &part_name, &mut buffer, NOOP_PROGRESS)?;
 
-            // Bootctrl is 0x20 bytes
-            if buffer.len() < OFFSET_SLOT_SUFFIX + 0x20 {
-                continue;
-            }
-
-            if let Some(mut bootctrl) = BootControl::parse(&buffer[OFFSET_SLOT_SUFFIX..]) {
-                bootctrl.bctrl_part = part.into();
-                self.dev_info.set_bootctrl(bootctrl.clone());
-                return Ok(bootctrl);
-            }
+        if buffer.len() < OFFSET_SLOT_SUFFIX + size_of::<BootControl>() {
+            return Err(Error::Hacc(BootControlError::InvalidSize.into()));
         }
 
-        Err(Error::penumbra("Failed to read BootControl, device might not support A/B slots."))
+        let bootctrl = BootControl::try_read(&buffer[OFFSET_SLOT_SUFFIX..])?;
+        self.devinfo.set_bootctrl(bootctrl.clone());
+
+        Ok(bootctrl)
     }
 
     /// Reads data from a specified partition on the device.
     /// This function assumes the partition to be part of the user section.
     /// To read from other sections, use `read_offset` with appropriate address.
-    pub fn read_partition<W, F>(&mut self, name: &str, writer: W, progress: F) -> Result<()>
+    /// This is NOT AB aware.
+    ///
+    /// # Examples
+    /// ```no_run
+    /// # use penumbra_mtk::{DeviceBuilder, port::{PortType, PortBackend}};
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let mtk_port = PortType::find_device(None, None, PortBackend::Auto).unwrap().unwrap();
+    /// # let mut device = DeviceBuilder::new(mtk_port).build()?;
+    /// # device.init()?;
+    /// use std::fs::File;
+    /// use std::io::BufWriter;
+    ///
+    /// let file = File::create("boot.img")?;
+    /// let mut writer = BufWriter::new(file);
+    /// let mut progress = |read: usize, total: usize| {
+    ///     println!("Read {}/{}", read, total);
+    /// };
+    /// device.read_flash("boot", &mut writer, &mut progress)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn read_flash<W, F>(&mut self, name: &str, writer: W, progress: F) -> Result<()>
     where
-        W: Write + Send,
-        F: FnMut(usize, usize) + Send,
+        W: Writer,
+        F: ProgressCallback,
     {
         self.ensure_da_mode()?;
 
         let part = self
-            .dev_info
+            .devinfo
             .get_partition(name)
-            .ok_or_else(|| Error::penumbra(format!("Partition '{}' not found", name)))?;
+            .ok_or_else(|| PenumbraError::PartitionNotFound(name.into()))?;
 
         let protocol = self.protocol.as_mut().unwrap();
-        protocol.read_flash(part.address, part.size, part.kind, writer, progress)
+        protocol.read_flash(&mut self.port, part.address, part.size, part.kind, writer, progress)
     }
 
     /// Writes data to a specified partition on the device.
     /// This function assumes the partition to be part of the user section.
     /// To write to other sections, use `write_offset` with appropriate address.
-    pub fn write_partition<R, F>(&mut self, name: &str, reader: R, progress: F) -> Result<()>
+    /// This is NOT AB aware.
+    ///
+    /// # Examples
+    /// ```no_run
+    /// # use penumbra_mtk::{DeviceBuilder, port::{PortType, PortBackend}};
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let mtk_port = PortType::find_device(None, None, PortBackend::Auto).unwrap().unwrap();
+    /// # let mut device = DeviceBuilder::new(mtk_port).build()?;
+    /// # device.init()?;
+    /// let firmware_data = std::fs::read("boot.img")?;
+    /// let mut progress = |written: usize, total: usize| {
+    ///     println!("Written {}/{}", written, total);
+    /// };
+    /// device.write_flash("boot", firmware_data.as_slice(), &mut progress)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn write_flash<R, F>(&mut self, name: &str, reader: R, progress: F) -> Result<()>
     where
-        R: Read + Send,
-        F: FnMut(usize, usize) + Send,
+        R: Reader,
+        F: ProgressCallback,
     {
         self.ensure_da_mode()?;
 
         let part = self
-            .dev_info
+            .devinfo
             .get_partition(name)
-            .ok_or_else(|| Error::penumbra(format!("Partition '{}' not found", name)))?;
+            .ok_or_else(|| PenumbraError::PartitionNotFound(name.into()))?;
 
         let protocol = self.protocol.as_mut().unwrap();
-        protocol.write_flash(part.address, part.size, part.kind, reader, progress)
+        protocol.write_flash(&mut self.port, part.address, part.size, part.kind, reader, progress)
     }
 
     /// Erases a specified partition on the device.
     /// This function assumes the partition to be part of the user section.
     /// To erase other sections, use `erase_offset` with the appropriate address.
+    /// This is NOT AB aware.
     ///
     /// # Examples
-    /// ```ignore
-    /// use penumbra::{DeviceBuilder, find_mtk_port};
+    /// ```no_run
+    /// use penumbra_mtk::DeviceBuilder;
+    /// use penumbra_mtk::port::{PortBackend, PortType};
     ///
-    /// let mtk_port = find_mtk_port().ok_or("No MTK port found")?;
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mtk_port = PortType::find_device(None, None, PortBackend::Auto)
+    ///     .expect("Port should open")
+    ///     .ok_or("No MTK port found")?;
     /// let da_data = std::fs::read("path/to/da/file").expect("Failed to read DA file");
-    /// let mut device =
-    ///     DeviceBuilder::default().with_mtk_port(mtk_port).with_da_data(da_data).build()?;
+    /// let mut device = DeviceBuilder::new(mtk_port).with_da_data(&da_data).build()?;
     ///
     /// device.init()?;
     /// let mut progress = |erased: usize, total: usize| {
     ///     println!("Erased: {}/{}", erased, total);
     /// };
-    /// device.erase_partition("userdata", &mut progress)?;
+    /// device.erase_flash("userdata", &mut progress)?;
+    /// Ok(())
+    /// # }
     /// ```
-    pub fn erase_partition<F>(&mut self, partition: &str, progress: F) -> Result<()>
+    pub fn erase_flash<F>(&mut self, name: &str, progress: F) -> Result<()>
     where
-        F: FnMut(usize, usize) + Send,
+        F: ProgressCallback,
     {
         self.ensure_da_mode()?;
 
         let part = self
-            .dev_info
-            .get_partition(partition)
-            .ok_or_else(|| Error::penumbra(format!("Partition '{}' not found", partition)))?;
+            .devinfo
+            .get_partition(name)
+            .ok_or_else(|| PenumbraError::PartitionNotFound(name.into()))?;
 
         let protocol = self.protocol.as_mut().unwrap();
-        protocol.erase_flash(part.address, part.size, part.kind, progress)
+        protocol.erase_flash(&mut self.port, part.address, part.size, part.kind, progress)
     }
 
     /// Reads data from a specified offset and size on the device.
-    /// This allows reading from arbitrary locations, not limited to named partitions.
+    /// This allows reading from arbitrary locations of the flash.
     /// To specify the section (e.g., user, pl_part1, pl_part2), provide the appropriate
     /// `PartitionKind`.
     ///
     /// # Examples
-    /// ```ignore
+    /// ```no_run
     /// // Let's assume we want to read preloader
-    /// use penumbra::{DeviceBuilder, PartitionKind, find_mtk_port};
+    /// use penumbra_mtk::DeviceBuilder;
+    /// use penumbra_mtk::port::{PortBackend, PortType};
+    /// use penumbra_mtk::storage::{EmmcPartition, PartitionKind};
     ///
-    /// let mtk_port = find_mtk_port().ok_or("No MTK port found")?;
-    /// let mut device = DeviceBuilder::default().with_mtk_port(mtk_port).build()?;
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mtk_port = PortType::find_device(None, None, PortBackend::Auto)
+    ///     .expect("Port should open")
+    ///     .ok_or("No MTK port found")?;
+    /// let mut device = DeviceBuilder::new(mtk_port).build()?;
     ///
     /// device.init()?;
     ///
     /// let mut progress = |read: usize, total: usize| {
     ///     println!("Read: {}/{}", read, total);
     /// };
-    /// let preloader_data = device.read_offset(
+    /// let mut preloader_data = Vec::new();
+    /// device.read_offset(
     ///     0x0,
     ///     0x40000,
     ///     PartitionKind::Emmc(EmmcPartition::Boot1),
+    ///     &mut preloader_data,
     ///     &mut progress,
     /// )?;
+    /// Ok(())
+    /// # }
     /// ```
     pub fn read_offset<W, F>(
         &mut self,
@@ -646,27 +868,32 @@ impl Device {
         progress: F,
     ) -> Result<()>
     where
-        W: Write + Send,
-        F: FnMut(usize, usize) + Send,
+        W: Writer,
+        F: ProgressCallback,
     {
         self.ensure_da_mode()?;
 
         let protocol = self.protocol.as_mut().unwrap();
-        protocol.read_flash(address, size, section, writer, progress)
+        protocol.read_flash(&mut self.port, address, size, section, writer, progress)
     }
 
     /// Writes data to a specified offset and size on the device.
-    /// This allows writing to arbitrary locations, not limited to named partitions.
+    /// This allows writing to arbitrary locations of the flash, as long as the region is writable.
     /// To specify the section (e.g., user, pl_part1, pl_part2), provide the appropriate
     /// `PartitionKind`.
     ///
     /// # Examples
-    /// ```ignore
+    /// ```no_run
     /// // Let's assume we want to write to preloader
-    /// use penumbra::{DeviceBuilder, PartitionKind, find_mtk_port};
+    /// use penumbra_mtk::DeviceBuilder;
+    /// use penumbra_mtk::port::{PortBackend, PortType};
+    /// use penumbra_mtk::storage::{EmmcPartition, PartitionKind};
     ///
-    /// let mtk_port = find_mtk_port().ok_or("No MTK port found")?;
-    /// let mut device = DeviceBuilder::default().with_mtk_port(mtk_port).build()?;
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mtk_port = PortType::find_device(None, None, PortBackend::Auto)
+    ///     .expect("Port should open")
+    ///     .ok_or("No MTK port found")?;
+    /// let mut device = DeviceBuilder::new(mtk_port).build()?;
     ///
     /// device.init()?;
     ///
@@ -678,10 +905,12 @@ impl Device {
     /// device.write_offset(
     ///     0x1000, // Actual preloader offset is 0x0, but we skip the header to ensure correct writing
     ///     preloader_data.len(),
-    ///     &preloader_data,
     ///     PartitionKind::Emmc(EmmcPartition::Boot1),
+    ///     preloader_data.as_slice(),
     ///     &mut progress,
     /// )?;
+    /// Ok(())
+    /// # }
     /// ```
     pub fn write_offset<R, F>(
         &mut self,
@@ -692,34 +921,40 @@ impl Device {
         progress: F,
     ) -> Result<()>
     where
-        R: Read + Send,
-        F: FnMut(usize, usize) + Send,
+        R: Reader,
+        F: ProgressCallback,
     {
         self.ensure_da_mode()?;
 
         let protocol = self.protocol.as_mut().unwrap();
-        protocol.write_flash(address, size, section, reader, progress)
+        protocol.write_flash(&mut self.port, address, size, section, reader, progress)
     }
 
     /// Erases data at a specified offset and size on the device.
-    /// This allows erasing arbitrary locations, not limited to named partitions.
+    /// This allows erasing arbitrary locations, as long as the region is erasable.
     /// To specify the section (e.g., user, pl_part1, pl_part2), provide the appropriate
     /// `PartitionKind`.
     ///
     /// # Examples
-    /// ```ignore
-    /// use penumbra::{DeviceBuilder, PartitionKind, find_mtk_port};
+    /// ```no_run
+    /// use penumbra_mtk::DeviceBuilder;
+    /// use penumbra_mtk::port::{PortBackend, PortType};
+    /// use penumbra_mtk::storage::{EmmcPartition, PartitionKind};
     ///
-    /// let mtk_port = find_mtk_port().ok_or("No MTK port found")?;
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mtk_port = PortType::find_device(None, None, PortBackend::Auto)
+    ///     .expect("Port should open")
+    ///     .ok_or("No MTK port found")?;
     /// let da_data = std::fs::read("path/to/da/file").expect("Failed to read DA file");
-    /// let mut device =
-    ///     DeviceBuilder::default().with_mtk_port(mtk_port).with_da_data(da_data).build()?;
+    /// let mut device = DeviceBuilder::new(mtk_port).with_da_data(&da_data).build()?;
     ///
     /// device.init()?;
     /// let mut progress = |erased: usize, total: usize| {
     ///     println!("Erased: {}/{}", erased, total);
     /// };
     /// device.erase_offset(0x0, 0x40000, PartitionKind::Emmc(EmmcPartition::Boot1), &mut progress)?;
+    /// Ok(())
+    /// # }
     /// ```
     pub fn erase_offset<F>(
         &mut self,
@@ -729,15 +964,15 @@ impl Device {
         progress: F,
     ) -> Result<()>
     where
-        F: FnMut(usize, usize) + Send,
+        F: ProgressCallback,
     {
         self.ensure_da_mode()?;
 
         let protocol = self.protocol.as_mut().unwrap();
-        protocol.erase_flash(address, size, section, progress)
+        protocol.erase_flash(&mut self.port, address, size, section, progress)
     }
 
-    /// Like `write_partition`, but instead of writing using offsets and sizes from GPT,
+    /// Like `write_flash`, but instead of writing using offsets and sizes from GPT,
     /// it uses the partition name directly.
     ///
     /// This is the same method uses by SP Flash Tool when flashing firmware files.
@@ -745,18 +980,29 @@ impl Device {
     /// without hitting security checks, since the data is first uploaded and then verified as a
     /// whole.
     ///
-    /// # Examples
-    /// ```ignore
-    /// use penumbra::{DeviceBuilder, find_mtk_port};
+    /// This is NOT AB aware.
     ///
-    /// let mtk_port = find_mtk_port().ok_or("No MTK port found")?;
-    /// let mut device = DeviceBuilder::default().with_mtk_port(mtk_port).build()?;
+    /// # Examples
+    /// ```no_run
+    /// use penumbra_mtk::DeviceBuilder;
+    /// use penumbra_mtk::port::{PortBackend, PortType};
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mtk_port = PortType::find_device(None, None, PortBackend::Auto)
+    ///     .expect("Port should open")
+    ///     .ok_or("No MTK port found")?;
+    /// let mut device = DeviceBuilder::new(mtk_port).build()?;
     ///
     /// device.init()?;
     /// let firmware_data = std::fs::read("logo.bin").expect("Failed to read firmware");
-    /// device.download("logo", firmware_data.len(), &firmware_data)?;
+    /// let mut progress = |written: usize, total: usize| {
+    ///     println!("Written: {}/{}", written, total);
+    /// };
+    /// device.write_partition("logo", firmware_data.len(), firmware_data.as_slice(), &mut progress)?;
+    /// Ok(())
+    /// # }
     /// ```
-    pub fn download<R, F>(
+    pub fn write_partition<R, F>(
         &mut self,
         partition: &str,
         size: usize,
@@ -764,31 +1010,36 @@ impl Device {
         progress: F,
     ) -> Result<()>
     where
-        R: Read + Send,
-        F: FnMut(usize, usize) + Send,
+        R: Reader,
+        F: ProgressCallback,
     {
         self.ensure_da_mode()?;
 
         let protocol = self.protocol.as_mut().unwrap();
-        protocol.download(partition, size, reader, progress)
+        protocol.write_partition(&mut self.port, partition, size, reader, progress)
     }
 
-    /// Like `read_partition`, but instead of reading using offsets and sizes from GPT,
+    /// Like `read_flash`, but instead of reading using offsets and sizes from GPT,
     /// it uses the partition name directly.
     ///
     /// This is the same method uses by SP Flash Tool when reading back without scatter.
     ///
+    /// This is NOT AB aware.
+    ///
     /// # Examples
-    /// ```ignore
+    /// ```no_run
     /// use std::fs::File;
     /// use std::io::BufWriter;
     ///
-    /// use penumbra::{DeviceBuilder, find_mtk_port};
+    /// use penumbra_mtk::DeviceBuilder;
+    /// use penumbra_mtk::port::{PortBackend, PortType};
     ///
-    /// let mtk_port = find_mtk_port().ok_or("No MTK port found")?;
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mtk_port = PortType::find_device(None, None, PortBackend::Auto)
+    ///     .expect("Port should open")
+    ///     .ok_or("No MTK port found")?;
     /// let da_data = std::fs::read("path/to/da/file").expect("Failed to read DA file");
-    /// let mut device =
-    ///     DeviceBuilder::default().with_mtk_port(mtk_port).with_da_data(da_data).build()?;
+    /// let mut device = DeviceBuilder::new(mtk_port).with_da_data(&da_data).build()?;
     ///
     /// device.init()?;
     /// // Readsback "logo" partition to "logo.bin"
@@ -797,333 +1048,606 @@ impl Device {
     /// let mut progress = |written: usize, total: usize| {
     ///     println!("Written: {}/{}", written, total);
     /// };
-    /// device.upload("logo", &mut writer, &mut progress)?;
+    /// device.read_partition("logo", &mut writer, &mut progress)?;
+    /// Ok(())
+    /// # }
     /// ```
-    pub fn upload<W, F>(&mut self, partition: &str, writer: W, progress: F) -> Result<()>
+    pub fn read_partition<W, F>(&mut self, partition: &str, writer: W, progress: F) -> Result<()>
     where
-        W: Write + Send,
-        F: FnMut(usize, usize) + Send,
+        W: Writer,
+        F: ProgressCallback,
     {
         self.ensure_da_mode()?;
 
         let protocol = self.protocol.as_mut().unwrap();
-        protocol.upload(partition, writer, progress)
+        protocol.read_partition(&mut self.port, partition, writer, progress)
     }
 
     /// Formats a specified partition on the device.
     ///
-    /// # Examples
-    /// ```ignore
-    /// use penumbra::{DeviceBuilder, find_mtk_port};
+    /// This is NOT AB aware.
     ///
-    /// let mtk_port = find_mtk_port().ok_or("No MTK port found")?;
+    /// # Examples
+    /// ```no_run
+    /// use penumbra_mtk::DeviceBuilder;
+    /// use penumbra_mtk::port::{PortBackend, PortType};
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mtk_port = PortType::find_device(None, None, PortBackend::Auto)
+    ///     .expect("Port should open")
+    ///     .ok_or("No MTK port found")?;
     /// let da_data = std::fs::read("path/to/da/file").expect("Failed to read DA file");
-    /// let mut device =
-    ///     DeviceBuilder::default().with_mtk_port(mtk_port).with_da_data(da_data).build()?;
+    /// let mut device = DeviceBuilder::new(mtk_port).with_da_data(&da_data).build()?;
     ///
     /// device.init()?;
     /// let mut progress = |erased: usize, total: usize| {
     ///     println!("Erased: {}/{}", erased, total);
     /// };
-    /// device.format("userdata", &mut progress)?;
+    /// device.erase_partition("userdata", &mut progress)?;
+    /// Ok(())
+    /// # }
     /// ```
-    pub fn format<F>(&mut self, partition: &str, progress: F) -> Result<()>
+    pub fn erase_partition<F>(&mut self, partition: &str, progress: F) -> Result<()>
     where
-        F: FnMut(usize, usize) + Send,
+        F: ProgressCallback,
     {
         self.ensure_da_mode()?;
 
         let protocol = self.protocol.as_mut().unwrap();
-        protocol.format(partition, progress)
+        protocol.format_partition(&mut self.port, partition, progress)
     }
 
-    /// Shuts down the device.
+    /// Flashes the device partition using a scatter file.
+    /// The scatter file describes the layout of the partitions and their corresponding files to be
+    /// flashed.
     ///
     /// # Examples
-    /// ```ignore
-    /// use penumbra::{DeviceBuilder, find_mtk_port};
     ///
-    /// let mtk_port = find_mtk_port().ok_or("No MTK port found")?;
-    /// let da_data = std::fs::read("path/to/da/file").expect("Failed to read DA file");
-    /// let mut device =
-    ///     DeviceBuilder::default().with_mtk_port(mtk_port).with_da_data(da_data).build()?;
+    /// ```no_run
+    /// use std::fs::File;
+    /// use std::io::{BufReader, BufWriter};
+    /// # use penumbra_mtk::{DeviceBuilder, port::{PortType, PortBackend}};
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let mtk_port = PortType::find_device(None, None, PortBackend::Auto)
+    /// #     .expect("Port should open")
+    /// #     .ok_or("No MTK port found")?;
+    /// # let da_data = std::fs::read("path/to/da/file").expect("Failed to read DA file");
+    /// # let mut device = DeviceBuilder::new(mtk_port).with_da_data(&da_data).build()?;
+    /// # device.init()?;
     ///
-    /// device.init()?;
+    /// let scatter_content = std::fs::read_to_string("scatter.txt")?;
+    ///
+    /// let reader_source = |path: &str| {
+    ///     let file = File::open(path)?;
+    ///     let size = file.metadata()?.len() as usize;
+    ///     Ok((BufReader::new(file), size))
+    /// };
+    ///
+    /// let writer_sink = |path: &str| {
+    ///     let file = File::create(path)?;
+    ///     Ok(BufWriter::new(file))
+    /// };
+    ///
+    /// device.flash_scatter(&scatter_content, reader_source, writer_sink, |written, total| {
+    ///     println!("Progress: {written}/{total}")
+    /// })?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn flash_scatter<F, R, W, S, K>(
+        &mut self,
+        scatter: &str,
+        reader_source: S,
+        writer_sink: K,
+        progress: F,
+    ) -> Result<()>
+    where
+        P: MtkPort,
+        R: Reader,
+        W: Writer,
+        S: ReaderSource<R>,
+        K: WriterSink<W>,
+        F: ProgressCallback,
+    {
+        self.ensure_da_mode()?;
+
+        let protocol = self.protocol.as_mut().unwrap();
+        protocol.flash_scatter(&mut self.port, scatter, reader_source, writer_sink, progress)
+    }
+
+    /// Powers down the device and closes the connection when in DA mode.
+    ///
+    /// # Examples
+    /// ```no_run
+    /// # use penumbra_mtk::{DeviceBuilder, port::{PortType, PortBackend}};
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let mtk_port = PortType::find_device(None, None, PortBackend::Auto).unwrap().unwrap();
+    /// # let mut device = DeviceBuilder::new(mtk_port).build()?;
+    /// # device.init()?;
     /// device.shutdown()?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn shutdown(&mut self) -> Result<()> {
         self.ensure_da_mode()?;
 
         let protocol = self.protocol.as_mut().unwrap();
-        protocol.shutdown()
+        protocol.shutdown(&mut self.port)
     }
 
-    /// Reboots the device into the specified boot mode.
-    /// Supported boot modes include `Normal`, `HomeScreen`, `Fastboot`, `Test`, and `Meta`.
+    /// Reboots the device into the requested `BootMode` (e.g., Normal, Fastboot, Recovery).
     ///
     /// # Examples
-    /// ```ignore
-    /// use penumbra::{BootMode, DeviceBuilder, find_mtk_port};
-    ///
-    /// let mtk_port = find_mtk_port().ok_or("No MTK port found")?;
-    /// let da_data = std::fs::read("path/to/da/file").expect("Failed to read DA file");
-    /// let mut device =
-    ///     DeviceBuilder::default().with_mtk_port(mtk_port).with_da_data(da_data).build()?;
-    ///
-    /// device.init()?;
+    /// ```no_run
+    /// # use penumbra_mtk::{DeviceBuilder, port::{PortType, PortBackend}};
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let mtk_port = PortType::find_device(None, None, PortBackend::Auto).unwrap().unwrap();
+    /// # let mut device = DeviceBuilder::new(mtk_port).build()?;
+    /// # device.init()?;
+    /// use penumbra_mtk::da::BootMode;
     /// device.reboot(BootMode::Normal)?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn reboot(&mut self, bootmode: BootMode) -> Result<()> {
         self.ensure_da_mode()?;
 
         let protocol = self.protocol.as_mut().unwrap();
-        protocol.reboot(bootmode)
+        protocol.reboot(&mut self.port, bootmode)
     }
 
-    /// Sets the lock state in `seccfg` to either lock or unlock the bootloader.
-    /// Returns the raw `seccfg` data on success, or `None` if the operation fails.
-    ///
-    /// Only available when the `no_exploits` feature is **not** enabled.
-    /// Requires DA Extensions.
+    /// Dumps efuse data from DA mode to a file.
+    /// The format of the dumped efuse data is protocol specific.
     ///
     /// # Examples
-    /// ```ignore
-    /// use penumbra::{DeviceBuilder, LockFlag, find_mtk_port};
-    ///
-    /// let mtk_port = find_mtk_port().ok_or("No MTK port found")?;
-    /// let da_data = std::fs::read("path/to/da/file").expect("Failed to read DA file");
-    /// let mut device =
-    ///     DeviceBuilder::default().with_mtk_port(mtk_port).with_da_data(da_data).build()?;
-    ///
-    /// device.init()?;
-    /// let seccfg = device.set_seccfg_lock_state(LockFlag::Unlock);
-    /// ```
-    #[cfg(not(feature = "no_exploits"))]
-    pub fn set_seccfg_lock_state(&mut self, lock_state: LockFlag) -> Option<[u8; 512]> {
-        // Ensure DA mode first; this will populate partitions and storage
-        self.ensure_da_mode().ok()?;
-        let protocol = self.protocol.as_mut().unwrap();
-        protocol.set_seccfg_lock_state(lock_state)
-    }
-
-    /// Reads memory from the device at the given address and size.
-    /// The data is written to the provided `writer` as it is read.
-    ///
-    /// Only available when the `no_exploits` feature is **not** enabled.
-    ///
-    /// # Examples
-    /// ```ignore
+    /// ```no_run
+    /// # use penumbra_mtk::{DeviceBuilder, port::{PortType, PortBackend}};
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let mtk_port = PortType::find_device(None, None, PortBackend::Auto).unwrap().unwrap();
+    /// # let mut device = DeviceBuilder::new(mtk_port).build()?;
+    /// # device.init()?;
     /// use std::fs::File;
-    /// use std::io::BufWriter;
+    /// let file = File::create("efuse.bin")?;
+    /// device.read_efuses(file)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn read_efuses<W: Writer>(&mut self, writer: W) -> Result<()> {
+        self.ensure_da_mode()?;
+
+        let protocol = self.protocol.as_mut().unwrap();
+        protocol.read_efuses(&mut self.port, writer)
+    }
+
+    /// Blows efuses on the device from DA mode using data from a reader.
+    /// The data format is protocol specific and should match what is expected by the device.
+    /// DO NOT write back efuse data read from `read_efuses` as the format may differ between
+    /// operations, causing irreversible damage to the device.
     ///
-    /// use penumbra::{DeviceBuilder, find_mtk_port};
     ///
-    /// let mtk_port = find_mtk_port().ok_or("No MTK port found")?;
-    /// let da_data = std::fs::read("path/to/da/file").expect("Failed to read DA file");
-    /// let mut device =
-    ///     DeviceBuilder::default().with_mtk_port(mtk_port).with_da_data(da_data).build()?;
+    /// # Examples
+    /// ```no_run
+    /// # use penumbra_mtk::{DeviceBuilder, port::{PortType, PortBackend}};
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let mtk_port = PortType::find_device(None, None, PortBackend::Auto).unwrap().unwrap();
+    /// # let mut device = DeviceBuilder::new(mtk_port).build()?;
+    /// # device.init()?;
+    /// let efuse_data = std::fs::read("efuses.bin")?;
+    /// device.write_efuses(efuse_data.as_slice(), efuse_data.len())?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn write_efuses<R: Reader>(&mut self, reader: R, size: usize) -> Result<()> {
+        self.ensure_da_mode()?;
+
+        let protocol = self.protocol.as_mut().unwrap();
+        protocol.write_efuses(&mut self.port, reader, size)
+    }
+}
+
+#[cfg(feature = "exploits")]
+impl<'a, P: MtkPort> Device<'a, P> {
+    /// Sets the desired lock state for the seccfg partition.
+    /// The device must be in DA mode and exploitable for this operation to succeed.
+    /// This does not guarantee that the device will be unlocked completely, as other security
+    /// measures may still be in place, like RPMB lock and auto relock on boot.
     ///
-    /// device.init()?;
-    /// let file = File::create("dump.bin")?;
-    /// let mut writer = BufWriter::new(file);
+    /// # Examples
+    /// ```no_run
+    /// # use penumbra_mtk::{DeviceBuilder, port::{PortType, PortBackend}};
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let mtk_port = PortType::find_device(None, None, PortBackend::Auto).unwrap().unwrap();
+    /// # let mut device = DeviceBuilder::new(mtk_port).build()?;
+    /// # device.init()?;
+    /// use penumbra_mtk::hacc::LockState;
+    /// device.set_seccfg_lock_state(LockState::Unlock)?;
+    /// # Ok(())
+    /// # }
+    pub fn set_seccfg_lock_state(&mut self, state: LockState) -> Result<()> {
+        self.ensure_da_mode()?;
+
+        let protocol = self.protocol.as_mut().unwrap();
+        protocol.set_seccfg_lock_state(&mut self.port, state)
+    }
+
+    /// Sets the desired lock state for the RPMB partition.
+    /// This assumes the device is in DA mode and exploitable, and that the default MediaTek RPMB
+    /// lock state is used. This won't unlock devices with custom RPMB lock states or not
+    /// compatible with it.
+    /// This only works on devices with UFS storage.
+    ///
+    /// # Examples
+    /// ```no_run
+    /// # use penumbra_mtk::{DeviceBuilder, port::{PortType, PortBackend}};
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let mtk_port = PortType::find_device(None, None, PortBackend::Auto).unwrap().unwrap();
+    /// # let mut device = DeviceBuilder::new(mtk_port).build()?;
+    /// # device.init()?;
+    /// use hacc::LockState;
+    /// device.set_rpmb_lock_state(LockState::Unlock)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn set_rpmb_lock_state(&mut self, state: LockState) -> Result<()> {
+        self.ensure_da_mode()?;
+
+        let protocol = self.protocol.as_mut().unwrap();
+        protocol.set_rpmb_lock_state(&mut self.port, state)
+    }
+
+    /// Reads memory at the specified address.
+    /// The device must be in DA mode and exploitable for this operation to succeed.
+    ///
+    /// # Examples
+    /// ```no_run
+    /// # use penumbra_mtk::{DeviceBuilder, port::{PortType, PortBackend}};
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let mtk_port = PortType::find_device(None, None, PortBackend::Auto).unwrap().unwrap();
+    /// # let mut device = DeviceBuilder::new(mtk_port).build()?;
+    /// # device.init()?;
+    /// let mut buffer = Vec::new();
     /// let mut progress = |read: usize, total: usize| {
     ///     println!("Read: {}/{}", read, total);
     /// };
-    /// device.peek(0x0010_0000, 0x1000, &mut writer, &mut progress)?;
+    /// device.peek(0x100000, 1024, &mut buffer, &mut progress)?;
+    /// # Ok(())
+    /// # }
     /// ```
-    #[cfg(not(feature = "no_exploits"))]
-    pub fn peek<W, F>(&mut self, addr: u32, size: usize, writer: W, progress: F) -> Result<()>
+    pub fn peek<W, F>(&mut self, addr: u64, size: usize, writer: W, progress: F) -> Result<()>
     where
-        W: Write + Send,
-        F: FnMut(usize, usize) + Send,
+        W: Writer,
+        F: ProgressCallback,
     {
         self.ensure_da_mode()?;
 
         let protocol = self.protocol.as_mut().unwrap();
-        protocol.peek(addr, size, writer, progress)
+        protocol.peek(&mut self.port, addr, size, writer, progress)
     }
 
-    /// Writes memory to the device at the given address and size.
-    /// The data is read from the provided `reader` as it is written.
-    ///
-    /// Only available when the `no_exploits` feature is **not** enabled.
+    /// Writes memory to the specified address.
+    /// The device must be in DA mode and exploitable for this operation to succeed.
     ///
     /// # Examples
-    /// ```ignore
-    /// use std::fs::File;
-    /// use std::io::BufReader;
-    ///
-    /// use penumbra::{DeviceBuilder, find_mtk_port};
-    ///
-    /// let mtk_port = find_mtk_port().ok_or("No MTK port found")?;
-    /// let da_data = std::fs::read("path/to/da/file").expect("Failed to read DA file");
-    /// let mut device =
-    ///     DeviceBuilder::default().with_mtk_port(mtk_port).with_da_data(da_data).build()?;
-    ///
-    /// device.init()?;
-    /// let file = File::open("dump.bin")?;
-    /// let mut reader = BufReader::new(file);
+    /// ```no_run
+    /// # use penumbra_mtk::{DeviceBuilder, port::{PortType, PortBackend}};
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let mtk_port = PortType::find_device(None, None, PortBackend::Auto).unwrap().unwrap();
+    /// # let mut device = DeviceBuilder::new(mtk_port).build()?;
+    /// # device.init()?;
+    /// let payload = vec![0x44; 1024]; // 1kb of As
     /// let mut progress = |written: usize, total: usize| {
     ///     println!("Written: {}/{}", written, total);
     /// };
-    /// device.poke(0x0010_0000, 0x1000, &mut reader, &mut progress)?;
+    /// device.poke(0x100000, payload.len(), payload.as_slice(), &mut progress)?;
+    /// # Ok(())
+    /// # }
     /// ```
-    #[cfg(not(feature = "no_exploits"))]
-    pub fn poke<R, F>(&mut self, addr: u32, size: usize, reader: R, progress: F) -> Result<()>
+    pub fn poke<R, F>(&mut self, addr: u64, size: usize, reader: R, progress: F) -> Result<()>
     where
-        R: Read + Send,
-        F: FnMut(usize, usize) + Send,
+        R: Reader,
+        F: ProgressCallback,
     {
         self.ensure_da_mode()?;
 
         let protocol = self.protocol.as_mut().unwrap();
-        protocol.poke(addr, size, reader, progress)
+        protocol.poke(&mut self.port, addr, size, reader, progress)
     }
 
-    /// Reads from the RPMB partition.
-    /// The RPMB is a special partition protected with authentication and counter mechanisms.
-    /// On eMMC, the `region` parameter is ignored since there is only one RPMB region.
-    /// On UFS, the `region` parameter specifies which RPMB region to read from.
-    /// Only available when the `no_exploits` feature is **not** enabled.
+    /// Reads a 32bit value from a specific register.
+    /// The device must be in DA mode and exploitable for this operation to succeed.
     ///
     /// # Examples
-    /// ```ignore
-    /// use std::fs::File;
-    /// use std::io::BufWriter;
+    /// ```no_run
+    /// # use penumbra_mtk::{DeviceBuilder, port::{PortType, PortBackend}};
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let mtk_port = PortType::find_device(None, None, PortBackend::Auto).unwrap().unwrap();
+    /// # let mut device = DeviceBuilder::new(mtk_port).build()?;
+    /// # device.init()?;
+    /// let register_val = device.read_register(0x1000A000)?;
+    /// println!("Register: 0x{:08X}", register_val);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn read_register(&mut self, addr: u64) -> Result<u32> {
+        self.ensure_da_mode()?;
+
+        let protocol = self.protocol.as_mut().unwrap();
+        protocol.read_register(&mut self.port, addr)
+    }
+
+    /// Writes a 32bit value to a specific register.
+    /// The device must be in DA mode and exploitable for this operation to succeed.
     ///
-    /// use penumbra::{DeviceBuilder, RpmbRegion, find_mtk_port};
+    /// # Examples
+    /// ```no_run
+    /// # use penumbra_mtk::{DeviceBuilder, port::{PortType, PortBackend}};
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let mtk_port = PortType::find_device(None, None, PortBackend::Auto).unwrap().unwrap();
+    /// # let mut device = DeviceBuilder::new(mtk_port).build()?;
+    /// # device.init()?;
+    /// device.write_register(0x1000A000, 0x2)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn write_register(&mut self, addr: u64, value: u32) -> Result<()> {
+        self.ensure_da_mode()?;
+
+        let protocol = self.protocol.as_mut().unwrap();
+        protocol.write_register(&mut self.port, addr, value)
+    }
+
+    /// Reads blocks from the specified RPMB region.
+    /// The device must be in DA mode and exploitable for this operation to succeed.
     ///
-    /// let mtk_port = find_mtk_port().ok_or("No MTK port found")?;
-    /// let da_data = std::fs::read("path/to/da/file").expect("Failed to read DA file");
-    /// let mut device =
-    ///     DeviceBuilder::default().with_mtk_port(mtk_port).with_da_data(da_data).build()?;
-    ///
-    /// device.init()?;
-    /// let file = File::create("rpmb_dump.bin")?;
-    /// let mut writer = BufWriter::new(file);
+    /// # Examples
+    /// ```no_run
+    /// # use penumbra_mtk::{DeviceBuilder, port::{PortType, PortBackend}};
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let mtk_port = PortType::find_device(None, None, PortBackend::Auto).unwrap().unwrap();
+    /// # let mut device = DeviceBuilder::new(mtk_port).build()?;
+    /// # device.init()?;
+    /// use penumbra_mtk::storage::RpmbRegion;
+    /// let mut buffer = Vec::new();
     /// let mut progress = |read: usize, total: usize| {
     ///     println!("Read: {}/{}", read, total);
     /// };
-    /// device.read_rpmb(RpmbRegion::Emmc, 0, 1, &mut writer, &mut progress)?;
+    /// // Read 1 sector from region 0 of RPMB starting from sector 0
+    /// device.read_rpmb(RpmbRegion::R0, 0, 1, &mut buffer, &mut progress)?;
+    /// # Ok(())
+    /// # }
     /// ```
-    #[cfg(not(feature = "no_exploits"))]
     pub fn read_rpmb<W, F>(
         &mut self,
-        region: RpmbRegion,
+        region: crate::storage::RpmbRegion,
         start_sector: u32,
         sectors_count: u32,
         writer: W,
         progress: F,
     ) -> Result<()>
     where
-        W: Write + Send,
-        F: FnMut(usize, usize) + Send,
+        W: Writer,
+        F: ProgressCallback,
     {
         self.ensure_da_mode()?;
+        self.ensure_rpmb_region_supported(region)?;
 
         let protocol = self.protocol.as_mut().unwrap();
-        protocol.read_rpmb(region, start_sector, sectors_count, writer, progress)
+        protocol.read_rpmb(&mut self.port, region, start_sector, sectors_count, writer, progress)
     }
 
-    /// Writes to the RPMB partition.
-    /// The RPMB is a special partition protected with authentication and counter mechanisms.
-    /// On eMMC, the `region` parameter is ignored since there is only one RPMB region.
-    /// On UFS, the `region` parameter specifies which RPMB region to write to.
-    /// Only available when the `no_exploits` feature is **not** enabled.
+    /// Writes blocks to the specified RPMB region.
+    /// The device must be in DA mode and exploitable for this operation to succeed.
     ///
     /// # Examples
-    /// ```ignore
-    /// use std::fs::File;
-    /// use std::io::BufReader;
-    ///
-    /// use penumbra::{DeviceBuilder, RpmbRegion, find_mtk_port};
-    ///
-    /// let mtk_port = find_mtk_port().ok_or("No MTK port found")?;
-    /// let da_data = std::fs::read("path/to/da/file").expect("Failed to read DA file");
-    /// let mut device =
-    ///     DeviceBuilder::default().with_mtk_port(mtk_port).with_da_data(da_data).build()?;
-    ///
-    /// device.init()?;
-    /// let file = File::open("rpmb_data.bin")?;
-    /// let mut reader = BufReader::new(file);
+    /// ```no_run
+    /// # use penumbra_mtk::{DeviceBuilder, port::{PortType, PortBackend}};
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let mtk_port = PortType::find_device(None, None, PortBackend::Auto).unwrap().unwrap();
+    /// # let mut device = DeviceBuilder::new(mtk_port).build()?;
+    /// # device.init()?;
+    /// use penumbra_mtk::storage::RpmbRegion;
+    /// let payload = vec![0u8; 512]; // 1 sector
     /// let mut progress = |written: usize, total: usize| {
     ///     println!("Written: {}/{}", written, total);
     /// };
-    /// device.write_rpmb(RpmbRegion::Emmc, 0, 1, &mut reader, &mut progress)?;
-    /// ```
-    #[cfg(not(feature = "no_exploits"))]
+    /// device.write_rpmb(RpmbRegion::R0, 0, 1, payload.as_slice(), &mut progress)?;
+    /// # Ok(())
+    /// # }
     pub fn write_rpmb<R, F>(
         &mut self,
-        region: RpmbRegion,
+        region: crate::storage::RpmbRegion,
         start_sector: u32,
         sectors_count: u32,
         reader: R,
         progress: F,
     ) -> Result<()>
     where
-        R: Read + Send,
-        F: FnMut(usize, usize) + Send,
+        R: Reader,
+        F: ProgressCallback,
+    {
+        self.ensure_da_mode()?;
+        self.ensure_rpmb_region_supported(region)?;
+
+        let protocol = self.protocol.as_mut().unwrap();
+        protocol.write_rpmb(&mut self.port, region, start_sector, sectors_count, reader, progress)
+    }
+
+    /// Writes blocks to the specified RPMB region.
+    /// The device must be in DA mode and exploitable for this operation to succeed.
+    ///
+    /// # Examples
+    /// ```no_run
+    /// # use penumbra_mtk::{DeviceBuilder, port::{PortType, PortBackend}};
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let mtk_port = PortType::find_device(None, None, PortBackend::Auto).unwrap().unwrap();
+    /// # let mut device = DeviceBuilder::new(mtk_port).build()?;
+    /// # device.init()?;
+    /// use penumbra_mtk::storage::RpmbRegion;
+    /// let mut progress = |written: usize, total: usize| {
+    ///     println!("Erased: {}/{}", written, total);
+    /// };
+    /// device.erase_rpmb(RpmbRegion::R0, 0, 1, &mut progress)?;
+    /// # Ok(())
+    /// # }
+    pub fn erase_rpmb<F>(
+        &mut self,
+        region: crate::storage::RpmbRegion,
+        start_sector: u32,
+        sectors_count: u32,
+        progress: F,
+    ) -> Result<()>
+    where
+        F: ProgressCallback,
+    {
+        self.ensure_da_mode()?;
+        self.ensure_rpmb_region_supported(region)?;
+
+        let protocol = self.protocol.as_mut().unwrap();
+        protocol.erase_rpmb(&mut self.port, region, start_sector, sectors_count, progress)
+    }
+
+    /// Authenticates the RPMB region with the provided key.
+    /// The device must be in DA mode and exploitable for this operation to succeed.
+    /// The key is validated against an authenticated RPMB response. A mismatched key returns an
+    /// error before subsequent RPMB operations are attempted.
+    ///
+    /// Each RPMB region has its own key, so you must authenticate each region separately.
+    /// On EMMC, the region will always default to R0.
+    ///
+    /// # Examples
+    /// ```no_run
+    /// # use penumbra_mtk::{DeviceBuilder, port::{PortType, PortBackend}};
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let mtk_port = PortType::find_device(None, None, PortBackend::Auto).unwrap().unwrap();
+    /// # let mut device = DeviceBuilder::new(mtk_port).build()?;
+    /// # device.init()?;
+    /// use penumbra_mtk::storage::RpmbRegion;
+    /// let auth_key = [0xAA; 32];
+    /// device.auth_rpmb(RpmbRegion::R0, &auth_key)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn auth_rpmb(&mut self, region: crate::storage::RpmbRegion, key: &[u8]) -> Result<()> {
+        self.ensure_da_mode()?;
+        self.ensure_rpmb_region_supported(region)?;
+
+        let protocol = self.protocol.as_mut().unwrap();
+        protocol.auth_rpmb(&mut self.port, region, key)
+    }
+
+    /// Returns whether an RPMB region is enabled and its configured 256-byte sector count.
+    pub fn get_rpmb_region_info(
+        &mut self,
+        region: crate::storage::RpmbRegion,
+    ) -> Result<(bool, u32)> {
+        self.ensure_da_mode()?;
+        self.ensure_rpmb_region_supported(region)?;
+
+        let protocol = self.protocol.as_mut().unwrap();
+        protocol.get_rpmb_region_info(&mut self.port, region)
+    }
+
+    /// Performs AES crypto operations with the device's crypto engine "SEJ"
+    /// The device must be in DA mode and exploitable for this operation to succeed.
+    /// If anti-clone is enabled, the key_id and key_sz parameters will be ignored, and
+    /// the device HUK (Hardware Unique Key) will be used instead.
+    ///
+    /// If legacy is enabled with anti-clone or HwKey, the device will use the legacy SEJ
+    /// initialization, deriving a key from a fixed pattern.
+    ///
+    /// If legacy is disabled, the device will perform KDF. This is supported only on modern V5
+    /// (XFlash) and V6 (XML) devices.
+    ///
+    ///
+    /// # Examples
+    /// ```no_run
+    /// # use penumbra_mtk::{DeviceBuilder, port::{PortType, PortBackend}};
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let mtk_port = PortType::find_device(None, None, PortBackend::Auto).unwrap().unwrap();
+    /// # let mut device = DeviceBuilder::new(mtk_port).build()?;
+    /// # device.init()?;
+    /// use penumbra_mtk::da::extensions::SejParams;
+    /// let mut output = Vec::new();
+    /// let input = b"Hello, World!";
+    /// let params = SejParams::default();
+    /// device.sej_aes(params, &input[..], &mut output)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn sej_aes<R, W>(
+        &mut self,
+        params: extensions::SejParams,
+        reader: R,
+        writer: W,
+    ) -> Result<()>
+    where
+        R: Reader,
+        W: Writer,
     {
         self.ensure_da_mode()?;
 
         let protocol = self.protocol.as_mut().unwrap();
-        protocol.write_rpmb(region, start_sector, sectors_count, reader, progress)
+        protocol.sej_aes(&mut self.port, params, reader, writer)
     }
 
-    /// Authenticate RPMB by setting the authentication key for the specified RPMB region.
-    /// The key must be 32 bytes long.
-    /// The authentication will be successful if the provided key matches the one programmed
-    /// in the device's storage OTP.
-    /// On eMMC, the `region` parameter is ignored since there is only one RPMB region.
-    /// On UFS, the `region` parameter specifies which RPMB region to authenticate against.
-    /// Only available when the `no_exploits` feature is **not** enabled.
+    /// Derives a key using the device crypto engine (TZCC or SSR on newer V6 devices).
+    /// The device must be in DA mode and exploitable for this operation to succeed.
+    ///
     ///
     /// # Examples
-    /// ```ignore
-    /// use penumbra::{DeviceBuilder, RpmbRegion, find_mtk_port};
-    ///
-    /// let mtk_port = find_mtk_port().ok_or("No MTK port found")?;
-    /// let da_data = std::fs::read("path/to/da/file").expect("Failed to read DA file");
-    /// let mut device =
-    ///     DeviceBuilder::default().with_mtk_port(mtk_port).with_da_data(da_data).build()?;
-    ///
-    /// device.init()?;
-    /// let key = b"eb3550a191deaf013062ffbdf97644a21fe153f497cb87efeb863aae979f4dd0";
-    /// device.auth_rpmb(RpmbRegion::Emmc, key)?;
+    /// ```no_run
+    /// # use penumbra_mtk::{DeviceBuilder, port::{PortType, PortBackend}};
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let mtk_port = PortType::find_device(None, None, PortBackend::Auto).unwrap().unwrap();
+    /// # let mut device = DeviceBuilder::new(mtk_port).build()?;
+    /// # device.init()?;
+    /// use penumbra_mtk::da::extensions::{KeyDeriveId, KeySize};
+    /// let derived_key = device.derive_key_by_id(KeyDeriveId::Rpmb, KeySize::Key256)?;
+    /// println!("Key length: {}", derived_key.len());
+    /// println!("Key: {:02X?}", derived_key);
+    /// # Ok(())
+    /// # }
     /// ```
-    #[cfg(not(feature = "no_exploits"))]
-    pub fn auth_rpmb(&mut self, region: RpmbRegion, key: &[u8]) -> Result<()> {
+    pub fn derive_key_by_id(&mut self, id: KeyDeriveId, len: KeySize) -> Result<Vec<u8>> {
         self.ensure_da_mode()?;
 
         let protocol = self.protocol.as_mut().unwrap();
-        protocol.auth_rpmb(region, key)
+
+        let params = extensions::KeyDeriveParams::Id { id, len };
+        protocol.derive_key(&mut self.port, params)
     }
 
-    /// Derives and authenticates the device RPMB key without reading or
-    /// writing RPMB data.
-    #[cfg(not(feature = "no_exploits"))]
-    pub fn verify_derived_rpmb_key(&mut self, region: RpmbRegion) -> Result<()> {
+    /// Derives a key using the device crypto engine (TZCC or SSR on newer V6 devices) with a custom
+    /// label and salt.
+    /// The device must be in DA mode and exploitable for this operation to succeed.
+    ///
+    /// The input label and salt must not exceed 32 bytes each.
+    ///
+    /// # Examples
+    /// ```no_run
+    /// # use penumbra_mtk::{DeviceBuilder, port::{PortType, PortBackend}};
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let mtk_port = PortType::find_device(None, None, PortBackend::Auto).unwrap().unwrap();
+    /// # let mut device = DeviceBuilder::new(mtk_port).build()?;
+    /// # device.init()?;
+    /// use penumbra_mtk::da::extensions::KeySize;
+    /// let derived_key = device.derive_key_by_input(b"custom_label", b"salt_123", KeySize::Key256)?;
+    /// println!("Key length: {}", derived_key.len());
+    /// assert_eq!(derived_key.len(), 32);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn derive_key_by_input(
+        &mut self,
+        label: &[u8],
+        salt: &[u8],
+        len: KeySize,
+    ) -> Result<Vec<u8>> {
         self.ensure_da_mode()?;
 
         let protocol = self.protocol.as_mut().unwrap();
-        protocol.verify_derived_rpmb_key(region)
-    }
 
-    /// Returns the number of 256-byte sectors in an RPMB region.
-    #[cfg(not(feature = "no_exploits"))]
-    pub fn get_rpmb_sector_count(&mut self, region: RpmbRegion) -> Result<u32> {
-        self.ensure_da_mode()?;
-
-        let protocol = self.protocol.as_mut().unwrap();
-        protocol.get_rpmb_sector_count(region)
-    }
-
-    /// Returns the enabled status and configured 256-byte sector count of an RPMB region.
-    #[cfg(not(feature = "no_exploits"))]
-    pub fn get_rpmb_region_info(&mut self, region: RpmbRegion) -> Result<(bool, u32)> {
-        self.ensure_da_mode()?;
-
-        let protocol = self.protocol.as_mut().unwrap();
-        protocol.get_rpmb_region_info(region)
+        let params = extensions::KeyDeriveParams::Input { label, salt, len };
+        protocol.derive_key(&mut self.port, params)
     }
 }

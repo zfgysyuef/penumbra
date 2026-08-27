@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::Args;
 use log::info;
-use penumbra::Device;
+use penumbra::{Device, MtkPort};
 
 use crate::cli::DeviceCommand;
 use crate::cli::common::{CONN_DA, CommandMetadata};
@@ -39,13 +39,13 @@ impl CommandMetadata for ReadArgs {
 }
 
 impl DeviceCommand for ReadArgs {
-    fn run(&self, dev: &mut Device, state: &mut PersistedDeviceState) -> Result<()> {
+    fn run<P: MtkPort>(&self, dev: &mut Device<P>, state: &mut PersistedDeviceState) -> Result<()> {
         dev.enter_da_mode()?;
 
         state.connection_type = CONN_DA;
         state.flash_mode = 1;
 
-        let Some(part) = dev.dev_info.get_partition(&self.partition) else {
+        let Some(part) = dev.get_partition_active(&self.partition) else {
             return Err(anyhow::anyhow!("Partition '{}' not found on device.", self.partition));
         };
 
@@ -63,7 +63,7 @@ impl DeviceCommand for ReadArgs {
             Ok(_) => {}
             Err(e) => {
                 pb.abandon("Read failed!");
-                return Err(e)?;
+                Err(e)?;
             }
         };
 

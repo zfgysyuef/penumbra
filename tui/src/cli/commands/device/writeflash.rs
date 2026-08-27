@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::Args;
 use log::info;
-use penumbra::Device;
+use penumbra::{Device, MtkPort};
 
 use crate::cli::DeviceCommand;
 use crate::cli::common::{CONN_DA, CommandMetadata};
@@ -40,7 +40,7 @@ impl CommandMetadata for WriteArgs {
 }
 
 impl DeviceCommand for WriteArgs {
-    fn run(&self, dev: &mut Device, state: &mut PersistedDeviceState) -> Result<()> {
+    fn run<P: MtkPort>(&self, dev: &mut Device<P>, state: &mut PersistedDeviceState) -> Result<()> {
         dev.enter_da_mode()?;
 
         state.connection_type = CONN_DA;
@@ -51,7 +51,7 @@ impl DeviceCommand for WriteArgs {
 
         let file_size = metadata(&self.file)?.len();
 
-        let Some(part) = dev.dev_info.get_partition(&self.partition) else {
+        let Some(part) = dev.get_partition_active(&self.partition) else {
             return Err(anyhow::anyhow!("Partition '{}' not found on device.", self.partition));
         };
 
@@ -64,9 +64,9 @@ impl DeviceCommand for WriteArgs {
 
         info!("Writing flash at address {:#X} with size {:#X}...", part.address, total_size);
 
-        if let Err(e) = dev.write_partition(&part.name, &mut reader, &mut progress_callback) {
+        if let Err(e) = dev.write_flash(&part.name, &mut reader, &mut progress_callback) {
             pb.abandon("Write failed!");
-            return Err(e)?;
+            Err(e)?;
         }
 
         info!("Flash write completed, {:#X} bytes written.", total_size);

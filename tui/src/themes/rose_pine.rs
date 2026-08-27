@@ -6,7 +6,7 @@ use ratatui::style::Color;
 
 use crate::themes::Theme;
 
-pub fn rose_pine_moon() -> Theme {
+pub const fn rose_pine_moon() -> Theme {
     Theme {
         name: "Rosé Pine Moon",
         id: "rose_pine_moon",

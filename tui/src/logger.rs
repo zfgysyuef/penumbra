@@ -33,18 +33,20 @@ pub fn init_logger(tui_mode: bool, verbose: bool) {
 
     builder.format(move |buf: &mut Formatter, record: &Record| {
         if tui_mode {
-            if verbose
-                && record.level() == Level::Debug
-                && let Some(ref log_file) = log_file
-            {
+            if verbose && let Some(ref log_file) = log_file {
                 let mut file = log_file.lock().unwrap();
-                return writeln!(file, "[DEBUG] {}", record.args());
+                let level = record.level();
+                writeln!(file, "[{}] {}", level, record.args())?;
+                drop(file);
             }
+
             Ok(())
         } else if record.level() == Level::Debug {
             if verbose && let Some(ref log_file) = log_file {
-                let mut file = log_file.lock().unwrap();
-                return writeln!(file, "[DEBUG] {}", record.args());
+                return {
+                    let mut file = log_file.lock().unwrap();
+                    writeln!(file, "[DEBUG] {}", record.args())
+                };
             }
             Ok(())
         } else {

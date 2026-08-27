@@ -18,31 +18,32 @@ pub enum Error {
     #[error("XML error: {0}")]
     Xml(#[from] XmlError),
     /// Generic Protocol error
-    #[error("Protocol Error {0}")]
-    Protocol(String),
+    #[error("Protocol Error: {0}")]
+    Protocol(#[from] ProtocolError),
+
+    #[error("Auth Error: {0}")]
+    Auth(#[from] AuthError),
+
     /// Connection specific error
     #[error("Connection Error: {0}")]
-    Connection(String),
+    Connection(#[from] ConnectionError),
     /// Error related to I/O operations
     /// In particular with the connection backends
     #[error("I/O Error: {0}")]
-    Io(String),
+    Io(#[from] std::io::Error),
     /// Error specific related to timeouts.
     /// Use this preferrably over the generic Io error when
     /// dealing with timeouts, so that we can handle them
     /// separately.
     #[error("Timeout")]
     Timeout,
-    /// Generic error that happens in Penumbra, can
-    /// be used for anything
-    #[error("Penumbra Error: {0}")]
-    Penumbra(String),
-    /// Error that takes a status code and formats it as hex.
-    /// When dealing with statuses in general, use
-    /// this, unless a more specific implementation
-    /// is there (e.g. XFlash)
-    #[error("{ctx}: Status is 0x{status:X}")]
-    Status { ctx: String, status: u32 },
+
+    #[error("Exploit error: {0}")]
+    Exploit(#[from] ExploitError),
+
+    #[error("Penumbra error: {0}")]
+    Penumbra(#[from] PenumbraError),
+
     #[error(transparent)]
     Read(#[from] wincode::ReadError),
     #[error(transparent)]
@@ -58,44 +59,202 @@ pub enum Error {
     #[error("Invalid UTF-16 string")]
     InvalidUtf16,
     #[error("HACC error: {0}")]
-    HaccError(#[from] hacc::Error),
+    Hacc(#[from] hacc::Error),
 }
 
-impl Error {
-    pub fn io<S: Into<String>>(msg: S) -> Self {
-        Self::Io(msg.into())
-    }
-
-    pub fn conn<S: Into<String>>(msg: S) -> Self {
-        Self::Connection(msg.into())
-    }
-
-    pub fn proto<S: Into<String>>(msg: S) -> Self {
-        Self::Protocol(msg.into())
-    }
-
-    pub fn penumbra<S: Into<String>>(msg: S) -> Self {
-        Self::Penumbra(msg.into())
-    }
+#[derive(Debug, Error)]
+pub enum ConnectionError {
+    #[error("Device port not found")]
+    PortNotFound,
+    #[error("Failed to open device connection: {0}")]
+    OpenFailed(String),
+    #[error("Device connection timed out")]
+    Timeout,
+    #[error("Device connection has been closed")]
+    Closed,
+    #[error("Device CDC setup failed")]
+    CdcSetupFailed,
+    #[error("Device interface not found")]
+    InterfaceNotFound,
+    #[error("Device port is not open")]
+    PortNotOpen,
+    #[error("Device control transfer OUT failed")]
+    CtrlTransferOutFailed,
+    #[error("Device control transfer IN failed")]
+    CtrlTransferInFailed,
 }
 
-impl From<std::io::Error> for Error {
-    fn from(value: std::io::Error) -> Self {
-        Self::penumbra(value.to_string())
-    }
+#[derive(Debug, Error)]
+pub enum ProtocolError {
+    #[error("Data mismatch")]
+    DataMismatch,
+    #[error("Invalid response length")]
+    InvalidResponseLength,
+    #[error("Handshake failed")]
+    HandshakeFailed,
+    #[error("Handshake mismatch: expected {0}, got {1}")]
+    HandshakeMismatch(u8, u8),
+    #[error("Invalid sync byte")]
+    InvalidSyncByte,
+    #[error("Invalid packet header")]
+    InvalidPacketHeader,
+    #[error("Invalid packet length")]
+    InvalidPacketLength,
+    #[error("DA SLA is enabled, but no signer can handle the request. Can't continue.")]
+    DaSlaCantHandle,
+    #[error("Failed to upload DA1")]
+    Da1UploadFailed,
+    #[error("Failed to upload DA2")]
+    Da2UploadFailed,
+    #[error("Failed to shutdown device")]
+    ShutdownFailed,
+    #[error("Invalid acknowledgment")]
+    InvalidAck,
+    #[error("Invalid response format")]
+    InvalidResponseFormat,
+    #[error("Cannot get storage info")]
+    CannotGetStorageInfo,
+    #[error("Preloader needed for EMI, but not provided")]
+    PreloaderNeeded,
+    #[error("EMI settings not found")]
+    EmiNotFound,
+}
+
+#[derive(Debug, Error)]
+pub enum AuthError {
+    #[error("No signer is available for this operation")]
+    NoSignerAvailable,
+    #[error("No matching key found")]
+    NoMatchingKeyFound,
+    #[error("Invalid signature")]
+    InvalidSignature,
+    #[error("Invalid signature length: expected {0}, got {1}")]
+    InvalidSigLen(u32, u32),
+    #[error("Signing purpose not supported")]
+    PurposeNotSupported,
+    #[error("{0}")]
+    Other(String),
+}
+
+#[derive(Debug, Error)]
+pub enum PenumbraError {
+    #[error("The protocol version used for this action is not supported by the device")]
+    WrongProtocolVersion,
+    #[error("Buffer too small")]
+    BufferTooSmall,
+    #[error("Invalid auth file")]
+    InvalidAuthFile,
+    #[error("A fresh BROM connection is required for the requested SLA challenge")]
+    BromSlaRequired,
+    #[error("DA Protocol not initialized")]
+    ProtocolNotInitialized,
+    #[error("Unsupported device")]
+    UnsupportedDevice,
+    #[error("No Download Agent (DA) provided")]
+    DaNotProvided,
+    #[error("Unknown chip with HW code: {0:X}")]
+    UnknownChip(u16),
+    #[error("No compatible DA found in the provided file for hw code: {0:X}:{1:X}")]
+    NoCompatibleDa(u16, u16),
+    #[error("Invalid GPT header")]
+    GptHeaderInvalid,
+    #[error("Invalid GPT entry size")]
+    GptEntrySizeInvalid,
+    #[error("GPT entry array size overflow")]
+    GptEntryArrayOverflow,
+    #[error("GPT checksum mismatch")]
+    GptChecksumMismatch,
+    #[error("Partition array out of bounds")]
+    PartitionArrayOutOfBounds,
+    #[error("SGPT buffer too small for entries")]
+    SgptBufferTooSmall,
+    #[error("Partition entry out of bounds")]
+    PartitionEntryOutOfBounds,
+    #[error("Partition {0} not found")]
+    PartitionNotFound(String),
+    #[error("Unsupported storage type")]
+    UnsupportedStorage,
+    #[error("Invalid RPMB region")]
+    InvalidRpmbRegion,
+    #[error("RPMB key must be exactly 32 bytes")]
+    InvalidRpmbKeyLength,
+    #[error("RPMB sector out of bounds")]
+    RpmbSectorOutOfBounds,
+    #[error("Patch exceeds data bounds")]
+    PatchExceedsBounds,
+    #[error("The algorithm for encrypting seccfg couldn't be found")]
+    SecCfgAlgoNotFound,
+    #[error("Invalid key source length")]
+    InvalidKeySourceLength,
+    #[error("Device does not support default RPMB lock state implementation")]
+    RpmbLockStateNotSupported,
+    #[error("Failed to find pattern in data")]
+    PatternNotFound,
+    #[error("Invalid scatter file format")]
+    InvalidScatterFile,
+    #[error("Scatter file has no partitions defined for this device storage type")]
+    ScatterFileNoParts,
+}
+
+#[derive(Debug, Error)]
+pub enum ExploitError {
+    #[error("Device is not vulnerable to this exploit")]
+    NotVulnerable,
+    #[error("Kamakiri error: {0}")]
+    Kamakiri(#[from] KamakiriError),
+    #[error("Carbonara error: {0}")]
+    Carbonara(#[from] CarbonaraError),
+    #[error("HeapBait error: {0}")]
+    HeapBait(#[from] HeapBaitError),
+}
+
+#[derive(Debug, Error)]
+pub enum KamakiriError {
+    #[error("No kamakiri payload found for this HW code {:X}", .0)]
+    NoPayload(u32),
+    #[error("Failed retrieving send_ptr")]
+    SendPtrFailed,
+}
+
+#[derive(Debug, Error)]
+pub enum CarbonaraError {
+    #[error("Failed to find DA1 hash offset")]
+    HashOffsetNotFound,
+}
+
+#[derive(Debug, Error)]
+pub enum HeapBaitError {
+    #[error("Failed to build shellcode")]
+    ShellcodeBuildFailed,
 }
 
 #[cfg(feature = "nusb")]
 impl From<nusb::Error> for Error {
     fn from(err: nusb::Error) -> Self {
-        Self::io(err.to_string())
+        Self::Io(err.into())
     }
 }
 
-#[cfg(feature = "libusb")]
+#[cfg(feature = "serial")]
+impl From<serialport::Error> for Error {
+    fn from(err: serialport::Error) -> Self {
+        Self::Io(err.into())
+    }
+}
+
+#[cfg(feature = "rusb")]
 impl From<rusb::Error> for Error {
     fn from(err: rusb::Error) -> Self {
-        Error::io(err.to_string())
+        match err {
+            rusb::Error::Timeout => Self::Timeout,
+            other => Self::Io(std::io::Error::other(other)),
+        }
+    }
+}
+
+impl From<rust_yaml::Error> for Error {
+    fn from(err: rust_yaml::Error) -> Self {
+        Self::ParseError(err.to_string())
     }
 }
 
@@ -397,8 +556,8 @@ pub enum XFlashErrorKind {
     ThreadError = 0xC0040002,
     #[error("Device: Checksum error")]
     ChecksumError = 0xC0040003,
-    #[error("Device: Unknown sparse image format")]
-    UnknownSparse = 0xC0040004,
+    #[error("Device: Image is too large")]
+    TooLarge = 0xC0040004,
     #[error("Device: Unknown sparse chunk type")]
     UnknownSparseChunkType = 0xC0040005,
     #[error("Device: Partition not found")]
@@ -541,6 +700,10 @@ pub enum XFlashErrorKind {
     ExtensionsRpmbKeyInvalid = 0xC00E0008,
     #[error("Extensions: RPMB support is not available on this storage type.")]
     ExtensionsRpmbStorageNotSupported = 0xC00E0009,
+    #[error("Extensions: Invalid Key length for KDF.")]
+    ExtensionsInvalidKeyLength = 0xC00E000A,
+    #[error("Extensions: Invalid Key source for KDF.")]
+    ExtensionsInvalidKeySource = 0xC00E000B,
 
     #[error("Unknown error")]
     Unknown = 0xFFFFFFFF,
@@ -560,15 +723,33 @@ impl XFlashError {
     }
 }
 
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub enum XmlErrorKind {
     Unknown,
     UnsupportedCmd,
     Cancel,
+    AntiRollbackViolation,
+    ExpectedCmdDownloadFile,
+    ExpectedCmdUploadFile,
+    ExpectedCmdProgressReport,
+    ExpectedFileSysOp,
+    SlaSignatureRejected,
+    UnknownPathSep,
+    Other(String),
+    // Extensions Errors
+    InvalidKeyDeriveLength,
+    InvalidLabelOrSaltLength,
+    SejAesLengthExceeded,
+    StorageUnknown,
+    InvalidRpmbKey,
+    RpmbNotInitialized,
+    RpmbInitFailed,
+    RpmbReadFailed,
+    RpmbWriteFailed,
 }
 
 #[derive(Debug, Error)]
-#[error("XML Error: {message}")]
+#[error("{message}")]
 pub struct XmlError {
     pub message: String,
     pub kind: XmlErrorKind,
@@ -585,10 +766,67 @@ impl XmlError {
         let msg = msg.trim_end_matches('\0');
 
         match msg {
-            "ERR!UNSUPPORTED" => Self::new("Unsupported command", XmlErrorKind::UnsupportedCmd),
-            "ERR!CANCEL" => Self::new("Cancelled", XmlErrorKind::Cancel),
-            _ => Self::new(msg, XmlErrorKind::UnsupportedCmd),
+            "ERR!UNSUPPORTED" => XmlErrorKind::UnsupportedCmd.into(),
+            "ERR!CANCEL" => XmlErrorKind::Cancel.into(),
+            "Invalid DA Version" => XmlErrorKind::AntiRollbackViolation.into(),
+            "Server is not authenticated. Locked." => XmlErrorKind::SlaSignatureRejected.into(),
+            "Unknow path separator." => XmlErrorKind::UnknownPathSep.into(),
+            "Invalid key derive output length" => XmlErrorKind::InvalidKeyDeriveLength.into(),
+            "Invalid label or salt length" => XmlErrorKind::InvalidLabelOrSaltLength.into(),
+            "SEJ AES data length exceeds maximum allowed" => {
+                XmlErrorKind::SejAesLengthExceeded.into()
+            }
+            "Storage type unknown, cannot initialize RPMB"
+            | "Storage type unknown, cannot read RPMB"
+            | "Storage type unknown, cannot write RPMB" => XmlErrorKind::StorageUnknown.into(),
+            "RPMB key must be 64 hex chars (32 bytes)" | "Invalid RPMB key format" => {
+                XmlErrorKind::InvalidRpmbKey.into()
+            }
+            "RPMB partition not initialized" => XmlErrorKind::RpmbNotInitialized.into(),
+            "RPMB initialization failed" => XmlErrorKind::RpmbInitFailed.into(),
+            "RPMB read failed" => XmlErrorKind::RpmbReadFailed.into(),
+            "RPMB write failed" => XmlErrorKind::RpmbWriteFailed.into(),
+            _ => Self::new(msg, XmlErrorKind::Unknown),
         }
+    }
+}
+
+impl From<XmlErrorKind> for XmlError {
+    fn from(kind: XmlErrorKind) -> Self {
+        if let XmlErrorKind::Other(msg) = &kind {
+            return Self::new(msg.clone(), kind);
+        }
+
+        let message = match kind {
+            XmlErrorKind::Unknown => "Unknown error",
+            XmlErrorKind::UnsupportedCmd => "Unsupported command",
+            XmlErrorKind::Cancel => "Cancelled",
+            XmlErrorKind::AntiRollbackViolation => "DA Antirollback violation, can't continue",
+            XmlErrorKind::ExpectedCmdDownloadFile => "Expected CMD:DOWNLOAD_FILE",
+            XmlErrorKind::ExpectedCmdUploadFile => "Expected CMD:UPLOAD_FILE",
+            XmlErrorKind::ExpectedCmdProgressReport => "Expected CMD:PROGRESS_REPORT",
+            XmlErrorKind::ExpectedFileSysOp => "Expected CMD:FILE-SYS-OPERATION",
+            XmlErrorKind::SlaSignatureRejected => "DA SLA signature rejected, can't continue",
+            XmlErrorKind::UnknownPathSep => "Unknown path separator",
+            XmlErrorKind::InvalidKeyDeriveLength => "Invalid key derive output length",
+            XmlErrorKind::InvalidLabelOrSaltLength => "Invalid label or salt length for KDF",
+            XmlErrorKind::SejAesLengthExceeded => "SEJ AES data length exceeds maximum allowed",
+            XmlErrorKind::StorageUnknown => "Storage type unknown, cannot perform RPMB operation",
+            XmlErrorKind::InvalidRpmbKey => "Invalid RPMB key format or length",
+            XmlErrorKind::RpmbNotInitialized => "RPMB partition not initialized",
+            XmlErrorKind::RpmbInitFailed => "RPMB initialization failed",
+            XmlErrorKind::RpmbReadFailed => "RPMB read failed",
+            XmlErrorKind::RpmbWriteFailed => "RPMB write failed",
+            XmlErrorKind::Other(_) => unreachable!(),
+        };
+
+        Self::new(message, kind)
+    }
+}
+
+impl From<XmlErrorKind> for Error {
+    fn from(kind: XmlErrorKind) -> Self {
+        Self::Xml(kind.into())
     }
 }
 
@@ -596,18 +834,31 @@ impl XmlError {
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Error, IntoPrimitive, TryFromPrimitive)]
 #[repr(u16)]
 pub enum BrPlErrorKind {
-    #[error("SEC: SLA challenge not completed. SLA must be completed before any proceeding")]
-    SlaNotPassed = 0x1D0D,
+    #[error("Read region check failed")]
+    ReadRegionChkFail = 0x1000,
+    #[error("Write region check failed")]
+    WriteRegionChkFail = 0x1001,
+
     #[error("SEC: This command can be executed only once")]
     CmdExecMoreThanOnce = 0x1D0C,
+    #[error("SEC: SLA challenge not completed. SLA must be completed before proceeding")]
+    SlaNotPassed = 0x1D0D,
+    #[error("SEC: DA overlap")]
+    DaOverlap = 0x1D0E,
+    #[error("SEC: Invalid DA jump address")]
+    DaInvalidJumpAddr = 0x1D0F,
     #[error("SEC: DA list max entries reached")]
     DaListMaxEntriesReached = 0x1D10,
     #[error("SEC: DAA signature error")]
     DaaSigError = 0x7015,
     #[error("SEC: An auth file is needed to continue")]
     ToolAuthIsNull = 0x7017,
+    #[error("SEC: SLA challenge verification failed")]
+    SlaChallengeVfyFailed = 0x7020,
     #[error("SEC: DAA signature verification failed")]
     DaaSigVfyFailed = 0x7024,
+    #[error("SEC: SLA challenge decryption failed")]
+    SlaChallengeDecryptFailed = 0x701F,
 
     #[error("Unknown error")]
     Unknown = 0xFFFF,

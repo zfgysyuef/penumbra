@@ -5,13 +5,13 @@
 
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use clap::Args;
-use log::info;
-use penumbra::{Device, find_mtk_port};
+use log::{error, info};
+use penumbra::{Device, MtkPort, PlProtocol};
 
 use crate::cli::DeviceCommand;
-use crate::cli::common::{CONN_BR, CONN_DA, CommandMetadata};
+use crate::cli::common::{CONN_DA, CommandMetadata};
 use crate::cli::state::PersistedDeviceState;
 
 #[derive(Args, Debug)]
@@ -28,7 +28,7 @@ impl CommandMetadata for CrashArgs {
 }
 
 impl DeviceCommand for CrashArgs {
-    fn run(&self, dev: &mut Device, state: &mut PersistedDeviceState) -> Result<()> {
+    fn run<P: MtkPort>(&self, dev: &mut Device<P>, state: &mut PersistedDeviceState) -> Result<()> {
         if state.connection_type == CONN_DA {
             info!("The device can't be crashed while in DA mode.");
             info!("Please reboot the device into Preloader mode and try again.");
@@ -40,32 +40,26 @@ impl DeviceCommand for CrashArgs {
 
         info!("Crashing device...");
 
-        // We ignore the error since this is the expected behaviour!!
-        dev.get_connection()?.send_da(&dummy_data, data_len, 0, data_len).ok();
-        dev.get_connection()?.port.close()?;
+        let port = dev.port_mut();
+        let mut pl = PlProtocol::new(port);
 
-        let mut last_seen = Instant::now();
-        let sleep_timeout = Duration::from_millis(500);
-        let timeout = Duration::from_secs(5);
-        let start = Instant::now();
+        pl.send_da(&dummy_data, data_len, 0, data_len).ok();
+
+        let _last_seen = Instant::now();
+        let _sleep_timeout = Duration::from_millis(500);
+        let _timeout = Duration::from_secs(5);
+        let _start = Instant::now();
 
         info!("Waiting for MTK device...");
-        let mtk_port = loop {
-            if let Some(port) = find_mtk_port() {
-                info!("Found MTK port: {}", port.get_port_name());
-                break port;
-            } else if Instant::now() > start + timeout {
-                return Err(anyhow::anyhow!("Device didn't come back online in time."));
-            } else if last_seen.elapsed() > sleep_timeout {
-                last_seen = Instant::now();
-            }
-        };
 
-        dev.get_connection()?.port = mtk_port;
+        if let Err(e) = port.reenumerate(0x0E8D, 0x0003) {
+            error!("Device did not come back online in time. Probably unsupported");
+            bail!(e);
+        }
 
-        dev.get_connection()?.handshake()?;
+        let mut pl = PlProtocol::new(port);
 
-        state.connection_type = CONN_BR;
+        pl.handshake()?;
 
         Ok(())
     }

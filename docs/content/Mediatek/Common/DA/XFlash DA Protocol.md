@@ -42,8 +42,8 @@ These commands are usually "getters" and "setters" for device parameters, like E
 Device Control are divided in ranges:
 * 0x020000 - 0x02FFFF: Setters (SetChecksumLevel, SetRemoteSecPolicy...)
 * 0x040000 - 0x04FFFF: Getters (GetEmmcInfo, GetUsbSpeed, GetChipId...)
-* 0x080001 - 0x08FFFF: Download controls? (StartDlInfo, EndDlInfo...)
-* 0x0E0000 - 0x0EFFFF: Storage Control? (CtrlStorageTest, DeviceCtrlReadRegister...)
+* 0x080001 - 0x08FFFF: Actions (StartDlInfo, EndDlInfo...)
+* 0x0E0000 - 0x0EFFFF: Devices Control (CtrlStorageTest, DeviceCtrlReadRegister...)
 
 To these, with [[DA Extensions]], a new range was added:
 * 0x0F0000 - 0x0FFFFF: Extensions Controls (ReadRPMB, WriteRPMB, ReadRegister, WriteRegister, Sej...)
@@ -77,9 +77,9 @@ To make sure the data is correctly received, the device and host will exchanges 
 
 During operation that might take some time (like erasing a partition), the device will enter a progress report mode, where it will periodically send progress updates to the host.
 
-The device will send 0x40040004 followed by a progress percentage (u32, 0-100), indicating the operation is still ongoing.
+The device will send `0x40040004` followed by a progress percentage (u32, 0-100), indicating the operation is still ongoing.
 
-When the operation is complete, the device will send 0x40040005 and the final status code (u32).
+When the operation is complete, the device will send `0x40040005` and the final status code (u32).
 
 ## Error codes
 

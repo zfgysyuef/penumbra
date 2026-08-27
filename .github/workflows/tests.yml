@@ -1,0 +1,33 @@
+name: Tests
+on:
+  push:
+    branches: [main]
+    paths:
+      - "**.rs"
+      - "**.toml"
+      - "!docs/**"
+  pull_request:
+    branches: [main]
+    paths:
+      - "**.rs"
+      - "**.toml"
+      - "!docs/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  checks: write
+  pull-requests: write
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libudev-dev
+      - name: Run tests
+        run: cargo test --workspace --verbose

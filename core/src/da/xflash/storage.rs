@@ -5,34 +5,30 @@
 
 use log::debug;
 
-use crate::core::storage::StorageKind;
-use crate::core::storage::emmc::EmmcStorage;
-use crate::core::storage::ufs::UfsStorage;
 use crate::da::xflash::{Cmd, XFlash};
+use crate::port::MtkPort;
+use crate::storage::{EmmcStorage, StorageKind, UfsStorage};
+use crate::traits::FromBytes;
 
 // TODO: Avoid repeated logic
-pub fn detect_storage(xflash: &mut XFlash) -> Option<StorageKind> {
-    let emmc_response = xflash.devctrl(Cmd::GetEmmcInfo, None);
-    let ufs_response = xflash.devctrl(Cmd::GetUfsInfo, None);
+pub fn detect_storage<P: MtkPort>(xflash: &mut XFlash, port: &mut P) -> Option<StorageKind> {
+    let emmc_response = xflash.devctrl(port, Cmd::GetEmmcInfo, None);
+    let ufs_response = xflash.devctrl(port, Cmd::GetUfsInfo, None);
 
     debug!("EMMC response: {:?}", emmc_response);
     debug!("UFS response: {:?}", ufs_response);
     if let Ok(resp) = emmc_response
-        && !resp.iter().all(|&b| b == 0)
+        && let Some(storage) = EmmcStorage::from_bytes(&resp)
     {
         debug!("eMMC storage detected.");
-        if let Ok(storage) = EmmcStorage::from_response(&resp) {
-            return Some(StorageKind::Emmc(storage));
-        }
+        return Some(StorageKind::Emmc(storage));
     }
 
     if let Ok(resp) = ufs_response
-        && !resp.iter().all(|&b| b == 0)
+        && let Some(storage) = UfsStorage::from_bytes(&resp)
     {
         debug!("UFS storage detected.");
-        if let Ok(storage) = UfsStorage::from_response(&resp) {
-            return Some(StorageKind::Ufs(storage));
-        }
+        return Some(StorageKind::Ufs(storage));
     }
 
     None

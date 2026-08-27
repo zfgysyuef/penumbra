@@ -81,10 +81,11 @@ Finally, a region has this structure
 | Signature length | `0x10-0x14` | How many bytes the signature of this region is long                   |
 
 For more information on how to parse a DA, I suggest looking at these resources:
-* [penumbra da parser](https://github.com/shomykohai/penumbra/blob/main/src/da/da.rs#L42)
+* [hacc da parser](https://github.com/shomykohai/hacc/blob/main/src/da.rs), penumbra uses this parser to parse DA files.
+* [penumbra parse_da python script](https://github.com/shomykohai/penumbra/blob/main/scripts/parse_da.py)
 
 ## Download Agent Security
 
 A DA can have some security measures.
 * DA SLA (Not to confuse with Preloader or BROM SLA), after the DA2 gets uploaded and executed, auth will be required to continue. The auth is an RSA key, and can be usually be found in the `SLA_Challenge.dll` file if the DA can perform actions with SP Flash Tool.
-* DAA (`Download Agent Authorization`, not DA specific, but needed for booting the DA), which verifies DA1 signature against the public key stored in the device efuses.
+* DAA (`Download Agent Authentication`, not DA specific, but needed for booting the DA), which verifies DA1 signature against the public key stored in the device efuses.

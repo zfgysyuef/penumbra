@@ -1,3 +1,7 @@
+/*
+    SPDX-License-Identifier: AGPL-3.0-or-later
+    SPDX-FileCopyrightText: 2026 Shomy
+*/
 use colored::Colorize;
 use indicatif::{ProgressBar, ProgressStyle};
 
@@ -41,6 +45,12 @@ impl AntumbraProgress {
 
     pub fn abandon(&self, msg: &str) {
         self.pb.abandon_with_message(msg.to_string());
+    }
+
+    pub fn set_total(&self, total: u64) {
+        if self.pb.length() != Some(total) {
+            self.pb.set_length(total);
+        }
     }
 
     pub fn get_callback<'a>(

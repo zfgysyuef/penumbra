@@ -4,19 +4,29 @@ members = [
     "core",
     "tui"
 ]
+default-members = ["tui"]
 
 [workspace.package]
 edition = "2024"
 version = "1.1.0"
 license = "AGPL-3.0-or-later"
-authors = ["Shomy <shomy@shomy.is-a.dev>"]
+authors = ["Shomy <git@itssho.my>"]
 homepage = "https://penumbra.itssho.my"
 repository = "https://github.com/shomykohai/penumbra"
 
+[profile.dev]
+opt-level = 0
+debug = true
+lto = false
+codegen-units = 16
+
 [profile.release]
-opt-level = "z"
-lto = true
+opt-level = 3
+lto = "fat"
 codegen-units = 1
-panic = "abort"
 strip = "symbols"
 debug = false
+
+[profile.bench]
+inherits = "release"
+debug = true

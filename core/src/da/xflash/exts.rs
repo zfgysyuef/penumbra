@@ -2,117 +2,156 @@
     SPDX-License-Identifier: AGPL-3.0-or-later
     SPDX-FileCopyrightText: 2025-2026 Shomy
 */
-use std::io::{Cursor, Read, Write};
+use std::io::Read;
 
-use log::{debug, info};
+use acon::MMIO;
+use hacc::DaEntry;
+use log::{debug, info, warn};
 
-use super::structs::{DACtx, ExtPointerTable, SejParams};
-use crate::core::ToBytes;
-use crate::core::storage::{RPMB_FRAME_DATA_SZ, RpmbRegion, Storage};
-use crate::da::DownloadProtocol;
-use crate::da::xflash::{Cmd, XFlash};
-use crate::error::{Error, Result};
-use crate::le_u32;
-use crate::utilities::analysis::{Arch, create_analyzer};
+use crate::da::extensions::{KeyDeriveId, KeyDeriveParams, KeySize, SejParams};
+use crate::da::protocol::NOOP_PROGRESS;
+use crate::da::xflash::Cmd;
+use crate::da::xflash::structs::AddressLengthParams;
+use crate::da::xflash::structs::extensions::{DaCtx, ExtPointerTable, RpmbParams};
+use crate::da::{DownloadProtocolExt, XFlash};
+use crate::error::{PenumbraError, ProtocolError, Result};
+use crate::port::{MAX_TIMEOUT, MtkPort};
+use crate::storage::RPMB_FRAME_DATA_SZ;
+use crate::traits::{ProgressCallback, Reader, ToBytes, Writer};
+use crate::utils::analysis::{ArchAnalyzer, Thumb2Analyzer};
+use crate::{DownloadProtocol, RpmbRegion, Storage};
 
 const DA_EXT: &[u8] = include_bytes!("../../../payloads/da_x.bin");
 // Won't go faster, and bigger packets makes the device hang
 const RPMB_WRITE_PKT_LEN: usize = 32 * 1024;
 const POINTER_TABLE_MAGIC: u32 = 0x54525450;
+const MAX_RPMB_TRANSFER_SECTORS: u32 = u32::MAX / RPMB_FRAME_DATA_SZ as u32;
 
-pub fn boot_extensions(xflash: &mut XFlash) -> Result<bool> {
-    debug!("Trying booting XFlash extensions...");
+fn checked_rpmb_data_len(start_sector: u32, num_sectors: u32, rpmb_size: u64) -> Result<usize> {
+    if num_sectors == 0 || num_sectors > MAX_RPMB_TRANSFER_SECTORS {
+        return Err(PenumbraError::RpmbSectorOutOfBounds.into());
+    }
 
-    let ext_data = match prepare_extensions(xflash) {
-        Some(data) => data,
-        None => {
-            debug!("Failed to prepare DA extensions");
-            return Ok(false);
+    let end = start_sector.checked_add(num_sectors).ok_or(PenumbraError::RpmbSectorOutOfBounds)?;
+    if rpmb_size != 0 {
+        let max_sectors = u32::try_from(rpmb_size / RPMB_FRAME_DATA_SZ as u64)
+            .map_err(|_| PenumbraError::RpmbSectorOutOfBounds)?;
+        if end > max_sectors {
+            return Err(PenumbraError::RpmbSectorOutOfBounds.into());
         }
+    }
+
+    (num_sectors as usize)
+        .checked_mul(RPMB_FRAME_DATA_SZ)
+        .ok_or_else(|| PenumbraError::RpmbSectorOutOfBounds.into())
+}
+
+pub fn boot_extensions<P: MtkPort>(
+    xflash: &mut XFlash,
+    port: &mut P,
+    da: &DaEntry<'_>,
+) -> Result<bool> {
+    debug!("Trying booting XFlash extensions...");
+    let Some(chip) = xflash.get_devinfo().chip() else {
+        warn!("Failed to get chip info, continuing without extensions");
+        return Ok(false);
+    };
+
+    let Some(exts) = prepare_extensions(xflash, da) else {
+        warn!("Failed to prepare DA extensions");
+        return Ok(false);
     };
 
     let ext_addr = 0x68000000;
-    let ext_size = ext_data.len() as u32;
+    let ext_size = exts.len() as u32;
 
     info!("Uploading DA extensions to 0x{:08X} (0x{:X} bytes)", ext_addr, ext_size);
-    if xflash.boot_to(ext_addr, &ext_data).is_err() {
+
+    if xflash.boot_to(port, ext_addr, &exts).is_err() {
         // If DA extensions fail to upload, we just return false, not a fatal error
-        info!("Failed to upload DA extensions, continuing without extensions");
+        warn!("Failed to upload DA extensions, continuing without extensions");
         return Ok(false);
     }
 
-    info!("DA extensions uploaded");
+    let ack = xflash.devctrl(port, Cmd::ExtAck, None)?;
 
-    let ack = xflash.devctrl(Cmd::ExtAck, None)?;
-    if ack.len() < 4 || le_u32!(ack, 0) != 0 {
-        info!("DA extensions ACK failed, continuing without extensions");
-        return Ok(false);
-    }
+    debug!("Received extension ack: {:?}", ack);
 
-    let sej_base = xflash.chip().sej_base();
-    let tzcc_base = xflash.chip().tzcc_base();
-    let da2_base = xflash.da.get_da2().map(|da2| da2.addr).unwrap_or(0);
-    let da2_size = xflash.da.get_da2().map(|da2| da2.data.len() as u32).unwrap_or(0);
-    let storage_type = xflash.get_storage_type() as u32;
+    let sej_base = chip.hacc();
+    // return 0 if None
+    let tzcc_base = chip.tzcc().map(|n| n.get()).unwrap_or_default();
+    let da2_base = da.da2().addr();
+    let da2_size = da.da2_code().len() as u32;
+    let storage_type = xflash.get_storage_type(port) as u32;
     let read_pkt_len = xflash.read_packet_length.unwrap_or(0x100) as u32;
     let write_pkt_len = xflash.write_packet_length.unwrap_or(0x100) as u32;
     let usb_log = xflash.usb_log_channel as u32;
 
-    let ctx = DACtx {
+    let ctx = DaCtx {
         sej_base,
         tzcc_base,
         da2_base,
         da2_size,
-        write_pkt_len,
-        read_pkt_len,
         storage_type,
+        read_pkt_len,
+        write_pkt_len,
         usb_log,
     };
 
-    xflash.devctrl(Cmd::ExtSetupDaCtx, Some(&[&ctx.to_bytes()]))?;
+    debug!("Sending DA context to device:");
+    debug!("  SEJ base: 0x{:08X}", ctx.sej_base);
+    debug!("  TZCC base: 0x{:08X}", ctx.tzcc_base);
+    debug!("  DA2 base: 0x{:08X}", ctx.da2_base);
+    debug!("  DA2 size: 0x{:08X}", ctx.da2_size);
+    debug!("  Storage type: 0x{:08X}", ctx.storage_type);
+    debug!("  Read packet length: 0x{:08X}", ctx.read_pkt_len);
+    debug!("  Write packet length: 0x{:08X}", ctx.write_pkt_len);
+    debug!("  USB log channel: 0x{:08X}", ctx.usb_log);
+
+    xflash.devctrl(port, Cmd::ExtSetupDaCtx, Some(&[&ctx.to_bytes()]))?;
 
     Ok(true)
 }
 
-fn prepare_extensions(xflash: &XFlash) -> Option<Vec<u8>> {
-    let da2 = &xflash.da.get_da2()?.data;
-    let da2address = xflash.da.get_da2()?.addr as u64;
+fn prepare_extensions(xflash: &mut XFlash, da: &DaEntry<'_>) -> Option<Vec<u8>> {
+    let da2 = da.da2_code();
+    let da2address = da.da2().addr() as u64;
 
     let mut da_ext_data = DA_EXT.to_vec();
 
-    let analyzer = create_analyzer(da2.clone(), da2address, Arch::Thumb2);
+    let analyzer = Thumb2Analyzer::new(da2.into(), da2address);
 
-    let off = analyzer.find_function_from_string("allocation was %zd bytes long at ptr %p\n")?;
-    let free = analyzer.offset_to_va(off)? as u32;
+    let off = analyzer.fn_from_str("allocation was %zd bytes long at ptr %p\n")?;
+    let free = analyzer.off_to_va(off)? as u32 | 1;
 
     debug!("Found free at 0x{:08X}", free);
 
     // kernel main
-    let off = analyzer.find_string_xref("\n***10.dagent_register_commands.\n")?;
-    let off = analyzer.get_next_bl_from_off(off + 6)?; // Skip dprintf
-    let off = analyzer.get_bl_target(off)?;
-    let off = analyzer.va_to_offset(off)?;
+    let off = analyzer.str_xref("\n***10.dagent_register_commands.\n")?;
+    let off = analyzer.next_bl_from_off(off + 6)?; // Skip dprintf
+    let off = analyzer.bl_target(off)?;
+    let off = analyzer.va_to_off(off)?;
     // + 0x20 to account of the extloader just in case
-    let off = analyzer.get_next_bl_from_off(off)?;
-    let reg_devc = analyzer.get_bl_target(off)? as u32 | 1;
+    let off = analyzer.next_bl_from_off(off)?;
+    let reg_devc = analyzer.bl_target(off)? as u32 | 1;
 
     debug!("Found register_device_ctrl at 0x{:08X}", reg_devc);
 
-    let off = analyzer.va_to_offset(reg_devc as u64)?;
-    let off = analyzer.get_next_bl_from_off(off)?;
-    let malloc = analyzer.get_bl_target(off)? as u32 | 1;
+    let off = analyzer.va_to_off(reg_devc as u64)?;
+    let off = analyzer.next_bl_from_off(off)?;
+    let malloc = analyzer.bl_target(off)? as u32 | 1;
 
     debug!("Found malloc at 0x{:08X}", malloc);
 
-    let off = analyzer.find_function_from_string("%s, mmc_set_part_config done!!\n")?;
-    let off = analyzer.get_next_bl_from_off(off)?; // Skip dprintf
+    let off = analyzer.fn_from_str("%s, mmc_set_part_config done!!\n")?;
+    let off = analyzer.next_bl_from_off(off)?; // Skip dprintf
 
-    let off = analyzer.get_bl_target(off)?;
+    let off = analyzer.bl_target(off)?;
     let mmc_get_card = off as u32 | 1;
 
     debug!("Found mmc_get_card at 0x{:08X}", mmc_get_card);
 
-    let uart_base = xflash.chip().uart();
+    let uart_base = xflash.get_devinfo().chip()?.uart0();
 
     debug!("UART base address at 0x{:X}", uart_base);
 
@@ -132,219 +171,226 @@ fn prepare_extensions(xflash: &XFlash) -> Option<Vec<u8>> {
     Some(da_ext_data)
 }
 
-pub fn read32_ext(xflash: &mut XFlash, addr: u32) -> Result<u32> {
-    xflash.devctrl(Cmd::ExtReadRegister, Some(&[&addr.to_le_bytes()]))?;
+pub(super) fn read_register(
+    xflash: &mut XFlash,
+    port: &mut impl MtkPort,
+    addr: u32,
+) -> Result<u32> {
+    xflash.devctrl(port, Cmd::ExtReadRegister, Some(&[&addr.to_le_bytes()]))?;
+    let data = xflash.read_data(port)?;
 
-    let payload = xflash.read_data()?;
-    status_ok!(xflash);
+    status_ok!(xflash, port)?;
 
-    Ok(le_u32!(payload, 0))
+    Ok(u32::from_le_bytes(data[0..4].try_into().map_err(|_| ProtocolError::InvalidResponseLength)?))
 }
 
-pub fn write32_ext(xflash: &mut XFlash, addr: u32, value: u32) -> Result<()> {
+pub(super) fn write_register(
+    xflash: &mut XFlash,
+    port: &mut impl MtkPort,
+    addr: u32,
+    value: u32,
+) -> Result<()> {
     let addr_bytes = addr.to_le_bytes();
     let value_bytes = value.to_le_bytes();
 
-    xflash.devctrl(Cmd::ExtWriteRegister, Some(&[&addr_bytes, &value_bytes]))?;
+    xflash.devctrl(port, Cmd::ExtWriteRegister, Some(&[&addr_bytes, &value_bytes]))?;
+    status_ok!(xflash, port)?;
 
     Ok(())
 }
 
-pub fn peek<W, F>(
+pub(super) fn peek<W: Writer, F: ProgressCallback, P: MtkPort>(
     xflash: &mut XFlash,
-    addr: u32,
+    port: &mut P,
+    addr: u64,
     length: usize,
     writer: W,
     progress: F,
-) -> Result<()>
-where
-    W: Write + Send,
-    F: FnMut(usize, usize) + Send,
-{
-    let mut range = [0u8; 16];
-    range[0..8].copy_from_slice(&(addr as u64).to_le_bytes());
-    range[8..16].copy_from_slice(&(length as u64).to_le_bytes());
+) -> Result<()> {
+    let range = AddressLengthParams { addr, length: length as u64 };
 
-    xflash.devctrl(Cmd::ExtReadMem, Some(&[&range]))?;
-    xflash.upload_data(length, writer, progress)?;
+    xflash.devctrl(port, Cmd::ExtReadMem, Some(&[&range.to_bytes()]))?;
+    xflash.upload_data(port, length, writer, progress)?;
 
-    status_ok!(xflash);
+    status_ok!(xflash, port)?;
 
     Ok(())
 }
 
-pub fn poke<R, F>(
+pub(super) fn poke<R: Reader, F: ProgressCallback, P: MtkPort>(
     xflash: &mut XFlash,
-    addr: u32,
+    port: &mut P,
+    addr: u64,
     length: usize,
     reader: R,
     progress: F,
-) -> Result<()>
-where
-    R: Read + Send,
-    F: FnMut(usize, usize) + Send,
-{
-    let mut range = [0u8; 16];
-    range[0..8].copy_from_slice(&(addr as u64).to_le_bytes());
-    range[8..16].copy_from_slice(&(length as u64).to_le_bytes());
+) -> Result<()> {
+    let range = AddressLengthParams { addr, length: length as u64 };
 
-    xflash.devctrl(Cmd::ExtWriteMem, Some(&[&range]))?;
-    xflash.download_data(length, reader, progress)?;
+    xflash.devctrl(port, Cmd::ExtWriteMem, Some(&[&range.to_bytes()]))?;
+    xflash.download_data(port, length, reader, progress)?;
 
-    status_ok!(xflash);
+    status_ok!(xflash, port)?;
 
     Ok(())
 }
 
-pub fn sej(
+pub(super) fn sej_aes<R: Reader, W: Writer, P: MtkPort>(
     xflash: &mut XFlash,
-    data: &[u8],
-    encrypt: bool,
-    legacy: bool,
-    anti_clone: bool,
-    xor: bool,
-) -> Result<Vec<u8>> {
-    let params = SejParams {
-        encrypt,
-        legacy,
-        anti_clone,
-        xor,
-        length: data.len() as u32,
-        ..Default::default()
-    };
+    port: &mut P,
+    params: &SejParams,
+    reader: R,
+    writer: W,
+) -> Result<()> {
+    xflash.devctrl(port, Cmd::ExtSej, Some(&[&params.to_bytes()]))?;
 
-    xflash.devctrl(Cmd::ExtSej, Some(&[&params.to_bytes()]))?;
+    xflash.download_data(port, params.length as usize, reader, NOOP_PROGRESS)?;
+    xflash.upload_data(port, params.length as usize, writer, NOOP_PROGRESS)?;
 
-    let mut reader = Cursor::new(data);
-    let mut payload = vec![0u8; data.len()];
-    let mut writer = Cursor::new(&mut payload);
+    status_ok!(xflash, port)?;
 
-    xflash.download_data(data.len(), &mut reader, |_, _| {})?;
-    xflash.upload_data(data.len(), &mut writer, |_, _| {})?;
-
-    status_ok!(xflash);
-
-    Ok(payload)
+    Ok(())
 }
 
-fn init_rpmb(xflash: &mut XFlash, region: RpmbRegion) -> Result<()> {
-    // Derive RPMB key (0 = RPMB)
-    xflash.devctrl(Cmd::ExtKeyDerive, Some(&[&0u32.to_le_bytes()]))?;
-    let rpmb_key = xflash.read_data()?;
-    status_ok!(xflash);
+fn init_rpmb<P: MtkPort>(xflash: &mut XFlash, port: &mut P, region: RpmbRegion) -> Result<()> {
+    let params = KeyDeriveParams::Id { id: KeyDeriveId::Rpmb, len: KeySize::Key256 };
+    let key = xflash.derive_key(port, params)?;
 
     // If the RPMB is already initialized (even with another key), this will succeed
     // without actually changing the key.
-    auth_rpmb(xflash, region, &rpmb_key)?;
+    xflash.auth_rpmb(port, region, &key)?;
 
     Ok(())
 }
 
-pub fn verify_derived_rpmb_key(xflash: &mut XFlash, region: RpmbRegion) -> Result<()> {
-    init_rpmb(xflash, region)
-}
-
-pub fn read_rpmb<W, F>(
+pub(super) fn read_rpmb<W: Writer, F: ProgressCallback, P: MtkPort>(
     xflash: &mut XFlash,
-    region: RpmbRegion,
+    port: &mut P,
+    region: crate::storage::RpmbRegion,
     start_sector: u32,
-    sectors_count: u32,
+    num_sectors: u32,
     writer: W,
     progress: F,
-) -> Result<()>
-where
-    W: Write + Send,
-    F: FnMut(usize, usize) + Send,
-{
-    init_rpmb(xflash, region)?;
-
-    let storage = match xflash.get_storage() {
-        Some(s) => s,
-        None => {
-            return Err(Error::penumbra("Failed to get storage information for RPMB read"));
-        }
-    };
-
-    if sectors_count == 0 {
-        return Err(Error::penumbra("RPMB sector count must be greater than 0"));
-    }
+) -> Result<()> {
+    let storage = xflash.get_storage(port).ok_or(ProtocolError::CannotGetStorageInfo)?;
 
     let rpmb_size = storage.get_rpmb_size();
-    if rpmb_size != 0 {
-        let max_sectors = (rpmb_size / RPMB_FRAME_DATA_SZ as u64) as u32;
-        if start_sector.checked_add(sectors_count).is_none_or(|end| end > max_sectors) {
-            return Err(Error::penumbra("Requested RPMB read range is out of bounds"));
-        }
-    } else {
+    let data_len = checked_rpmb_data_len(start_sector, num_sectors, rpmb_size)?;
+    if rpmb_size == 0 {
         info!("Device reports unknown RPMB size; skipping RPMB bounds check");
     }
 
-    let mut sector_range = [0u8; 8];
-    sector_range[0..4].copy_from_slice(&start_sector.to_le_bytes());
-    sector_range[4..8].copy_from_slice(&sectors_count.to_le_bytes());
+    init_rpmb(xflash, port, region)?;
 
+    let params = RpmbParams { start_sector, sectors_count: num_sectors }.to_bytes();
     let region = (region as u32).to_le_bytes();
-    let data_len = sectors_count as usize * RPMB_FRAME_DATA_SZ;
 
-    xflash.devctrl(Cmd::ExtRpmbRead, Some(&[&region, &sector_range]))?;
-    xflash.upload_data(data_len, writer, progress)?;
-    status_ok!(xflash);
+    xflash.devctrl(port, Cmd::ExtRpmbRead, Some(&[&region, &params]))?;
+    xflash.upload_data(port, data_len, writer, progress)?;
+    status_ok!(xflash, port)?;
 
     Ok(())
 }
 
-pub fn write_rpmb<R, F>(
+pub(super) fn write_rpmb<R: Reader, F: ProgressCallback, P: MtkPort>(
     xflash: &mut XFlash,
-    region: RpmbRegion,
+    port: &mut P,
+    region: crate::storage::RpmbRegion,
     start_sector: u32,
-    sectors_count: u32,
+    num_sectors: u32,
     reader: R,
     progress: F,
-) -> Result<()>
-where
-    R: Read + Send,
-    F: FnMut(usize, usize) + Send,
-{
-    init_rpmb(xflash, region)?;
-
-    let storage = match xflash.get_storage() {
-        Some(s) => s,
-        None => {
-            return Err(Error::penumbra("Failed to get storage information for RPMB write"));
-        }
-    };
-
-    if sectors_count == 0 {
-        return Err(Error::penumbra("RPMB sector count must be greater than 0"));
-    }
+) -> Result<()> {
+    let storage = xflash.get_storage(port).ok_or(ProtocolError::CannotGetStorageInfo)?;
 
     let rpmb_size = storage.get_rpmb_size();
-    if rpmb_size != 0 {
-        let max_sectors = (rpmb_size / RPMB_FRAME_DATA_SZ as u64) as u32;
-        if start_sector.checked_add(sectors_count).is_none_or(|end| end > max_sectors) {
-            return Err(Error::penumbra("Requested RPMB write range is out of bounds"));
-        }
-    } else {
+    let data_len = checked_rpmb_data_len(start_sector, num_sectors, rpmb_size)?;
+    if rpmb_size == 0 {
         info!("Device reports unknown RPMB size; skipping RPMB bounds check");
     }
 
-    let mut sector_range = [0u8; 8];
-    sector_range[0..4].copy_from_slice(&start_sector.to_le_bytes());
-    sector_range[4..8].copy_from_slice(&sectors_count.to_le_bytes());
+    if xflash.rpmb_authenticated_regions & (1 << (region as u8)) == 0 {
+        init_rpmb(xflash, port, region)?;
+    } else {
+        info!("Using the already authenticated RPMB key for RPMB write");
+    }
 
+    let params = RpmbParams { start_sector, sectors_count: num_sectors }.to_bytes();
     let region = (region as u32).to_le_bytes();
-    let data_len = sectors_count as usize * RPMB_FRAME_DATA_SZ;
 
-    xflash.devctrl(Cmd::ExtRpmbWrite, Some(&[&region, &sector_range]))?;
-    xflash.download_data_with(data_len, RPMB_WRITE_PKT_LEN, reader, progress)?;
-    status_ok!(xflash);
+    xflash.devctrl(port, Cmd::ExtRpmbWrite, Some(&[&region, &params]))?;
+    xflash.download_data_with(port, data_len, RPMB_WRITE_PKT_LEN, MAX_TIMEOUT, reader, progress)?;
+    status_ok!(xflash, port)?;
 
     Ok(())
 }
 
-pub fn auth_rpmb(xflash: &mut XFlash, region: RpmbRegion, key: &[u8]) -> Result<()> {
-    xflash.devctrl(Cmd::ExtRpmbInit, Some(&[&(region as u32).to_le_bytes(), key]))?;
-    status_ok!(xflash);
+pub(super) fn erase_rpmb<F: ProgressCallback, P: MtkPort>(
+    xflash: &mut XFlash,
+    port: &mut P,
+    region: RpmbRegion,
+    start_sector: u32,
+    num_sectors: u32,
+    progress: F,
+) -> Result<()> {
+    let total_bytes = num_sectors as u64 * RPMB_FRAME_DATA_SZ as u64;
+
+    let zero_reader = std::io::repeat(0).take(total_bytes);
+
+    xflash.write_rpmb(port, region, start_sector, num_sectors, zero_reader, progress)
+}
+
+pub(super) fn auth_rpmb<P: MtkPort>(
+    xflash: &mut XFlash,
+    port: &mut P,
+    region: RpmbRegion,
+    key: &[u8],
+) -> Result<()> {
+    if key.len() != 32 {
+        return Err(PenumbraError::InvalidRpmbKeyLength.into());
+    }
+
+    xflash.devctrl(port, Cmd::ExtRpmbInit, Some(&[&(region as u32).to_le_bytes(), key]))?;
+    status_ok!(xflash, port)?;
+    xflash.rpmb_authenticated_regions |= 1 << (region as u8);
 
     Ok(())
+}
+
+pub(super) fn derive_key<P: MtkPort>(
+    xflash: &mut XFlash,
+    port: &mut P,
+    params: KeyDeriveParams,
+) -> Result<Vec<u8>> {
+    const MAX_DATA_LEN: usize = 0x20;
+
+    match params {
+        KeyDeriveParams::Id { id, len } => {
+            let key_type = (id as u32).to_le_bytes();
+            let key_len = (len.to_bytes() as u32).to_le_bytes();
+
+            xflash.devctrl(port, Cmd::ExtKeyDerive, Some(&[&key_type, &key_len]))?;
+        }
+        KeyDeriveParams::Input { label, salt, len } => {
+            if label.len() > MAX_DATA_LEN || salt.len() > MAX_DATA_LEN {
+                return Err(PenumbraError::InvalidKeySourceLength.into());
+            }
+
+            let key_type = (KeyDeriveId::Input as u32).to_le_bytes();
+            let key_len = (len.to_bytes() as u32).to_le_bytes();
+            let label_len = (label.len() as u32).to_le_bytes();
+            let salt_len = (salt.len() as u32).to_le_bytes();
+
+            xflash.devctrl(
+                port,
+                Cmd::ExtKeyDerive,
+                Some(&[&key_type, &key_len, &label_len, &salt_len, label, salt]),
+            )?;
+        }
+    }
+
+    let key = xflash.read_data(port)?;
+    status_ok!(xflash, port)?;
+
+    Ok(key)
 }

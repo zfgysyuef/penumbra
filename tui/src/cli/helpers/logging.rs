@@ -3,20 +3,22 @@
     SPDX-FileCopyrightText: 2026 Shomy
 */
 
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::sync::mpsc;
+use std::thread;
+
 use log::warn;
 use penumbra::DeviceLog;
-use tokio::fs::OpenOptions;
-use tokio::io::AsyncWriteExt;
-use tokio::sync::mpsc;
 
-pub async fn setup_file_logger(path: &str) -> Option<DeviceLog> {
-    match OpenOptions::new().create(true).append(true).open(path).await {
+pub fn setup_file_logger(path: &str) -> Option<DeviceLog> {
+    match OpenOptions::new().create(true).append(true).open(path) {
         Ok(mut file) => {
-            let (tx, mut rx) = mpsc::channel::<String>(100);
+            let (tx, rx) = mpsc::sync_channel::<String>(100);
 
-            tokio::spawn(async move {
-                while let Some(msg) = rx.recv().await {
-                    if file.write_all(msg.as_bytes()).await.is_err() {
+            thread::spawn(move || {
+                while let Ok(msg) = rx.recv() {
+                    if file.write_all(msg.as_bytes()).is_err() {
                         break;
                     }
                 }

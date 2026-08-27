@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::Args;
 use log::info;
-use penumbra::Device;
+use penumbra::{Device, MtkPort};
 
 use crate::cli::DeviceCommand;
 use crate::cli::common::{CONN_DA, CommandMetadata};
@@ -41,7 +41,7 @@ impl CommandMetadata for DownloadArgs {
 }
 
 impl DeviceCommand for DownloadArgs {
-    fn run(&self, dev: &mut Device, state: &mut PersistedDeviceState) -> Result<()> {
+    fn run<P: MtkPort>(&self, dev: &mut Device<P>, state: &mut PersistedDeviceState) -> Result<()> {
         dev.enter_da_mode()?;
 
         state.connection_type = CONN_DA;
@@ -52,7 +52,7 @@ impl DeviceCommand for DownloadArgs {
 
         let file_size = metadata(&self.file)?.len();
 
-        let Some(part) = dev.dev_info.get_partition(&self.partition) else {
+        let Some(part) = dev.get_partition_active(&self.partition) else {
             return Err(anyhow::anyhow!("Partition '{}' not found on device.", self.partition));
         };
 
@@ -71,10 +71,10 @@ impl DeviceCommand for DownloadArgs {
         info!("Downloading to partition '{}'...", part.name);
 
         if let Err(e) =
-            dev.download(&part.name, file_size as usize, &mut reader, &mut progress_callback)
+            dev.write_partition(&part.name, file_size as usize, &mut reader, &mut progress_callback)
         {
             pb.abandon("Download failed!");
-            return Err(e)?;
+            Err(e)?;
         }
 
         info!("Download to partition '{}' completed.", part.name);

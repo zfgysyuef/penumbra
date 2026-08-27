@@ -9,8 +9,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Result, anyhow};
 use clap::Args;
 use log::info;
-use penumbra::Device;
-use penumbra::da::DownloadProtocol;
+use penumbra::{Device, MtkPort};
 
 use crate::cli::DeviceCommand;
 use crate::cli::common::{CONN_DA, CommandMetadata};
@@ -42,7 +41,7 @@ impl CommandMetadata for ReadAllArgs {
 }
 
 impl DeviceCommand for ReadAllArgs {
-    fn run(&self, dev: &mut Device, state: &mut PersistedDeviceState) -> Result<()> {
+    fn run<P: MtkPort>(&self, dev: &mut Device<P>, state: &mut PersistedDeviceState) -> Result<()> {
         let output_dir: &Path = &self.output_dir;
 
         if let Err(e) = create_dir_all(output_dir) {
@@ -63,15 +62,7 @@ impl DeviceCommand for ReadAllArgs {
         state.connection_type = CONN_DA;
         state.flash_mode = 1;
 
-        let partitions = dev.get_partitions();
-        if partitions.is_empty() {
-            info!("No partitions found on device.");
-            return Ok(());
-        }
-
-        let proto = dev.get_protocol().ok_or(anyhow!("Failed to get device protocol"))?;
-
-        for p in partitions {
+        for p in dev.partitions() {
             if self.skip.contains(&p.name) {
                 info!("Skipping partition '{}'", p.name);
                 continue;
@@ -87,17 +78,11 @@ impl DeviceCommand for ReadAllArgs {
 
             info!("Reading partition '{}'...", p.name);
 
-            match proto.read_flash(
-                p.address,
-                p.size,
-                p.kind,
-                &mut output_file,
-                &mut progress_callback,
-            ) {
-                Ok(_) => {}
-                Err(_) => {
-                    pb.abandon("Read failed! Skipping partition.");
-                }
+            if dev
+                .read_partition(p.name.as_str(), &mut output_file, &mut progress_callback)
+                .is_err()
+            {
+                pb.abandon("Read failed! Skipping partition.");
             }
 
             output_file.flush()?;

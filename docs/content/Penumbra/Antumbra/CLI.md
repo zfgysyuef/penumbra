@@ -6,11 +6,19 @@ You'll need a [[Download Agent]] to be able to interact with the device.
 If the device has DAA, you'll need the specific DA for your device.
 If the device has SLA, you'll probably either need an engineering preloader or paid auth.
 
-If you need to force [[Heapbait|HeapB8]] on an XML/V6 DA, pass `--force-heapb8`.
-This skips Carbonara during DA1 and keeps the DA2 patch path open for HeapB8.
+If an XML/V6 DA still needs [[Heapbait|HeapB8]] after [[Carbonara]] reports success, pass
+`--force-heapb8`. This preserves Carbonara's successful state while forcing the live HeapBait pass.
 
 ~~~sh
 antumbra --force-heapb8 pgpt --da DA.bin
+~~~
+
+For Xiaomi devices that require the one-time BROM challenge, provide the matching AUTH
+file and pass `--mi-auth`. Antumbra prints the `AgAA` BLOB in Base64 and hex, then waits for the
+256-byte SIGN in either encoding before continuing.
+
+~~~sh
+antumbra --da DA.bin --auth auth_sv5.auth --mi-auth rpmb info
 ~~~
 
 ## List all partitions

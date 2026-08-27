@@ -5,17 +5,24 @@
 use ratatui::buffer::Buffer;
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
 
-use crate::components::ThemedWidgetMut;
+use crate::app::AppCtx;
+use crate::components::{Component, FormField};
 use crate::themes::Theme;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct DropdownOption {
     pub label: String,
     pub value: String,
+}
+
+impl DropdownOption {
+    pub fn new(label: impl Into<String>, value: impl Into<String>) -> Self {
+        Self { label: label.into(), value: value.into() }
+    }
 }
 
 pub struct Dropdown {
@@ -30,22 +37,19 @@ impl Dropdown {
         Self { label: label.into(), options, selected, open: false }
     }
 
-    /// Returns the internal value of the selected option
     pub fn value(&self) -> &String {
         &self.options[self.selected].value
     }
 
-    /// Returns the display label of the selected option
     pub fn selected_label(&self) -> &String {
         &self.options[self.selected].label
     }
 
-    pub fn is_open(&self) -> bool {
+    pub const fn is_open(&self) -> bool {
         self.open
     }
 
-    #[allow(dead_code)]
-    pub fn set_selected(&mut self, idx: usize) {
+    pub const fn set_selected(&mut self, idx: usize) {
         if idx < self.options.len() {
             self.selected = idx;
         }
@@ -56,20 +60,22 @@ impl Dropdown {
             self.selected = index;
         }
     }
+}
 
-    pub fn handle_key(&mut self, key: KeyEvent) -> bool {
+impl Component for Dropdown {
+    fn handle_key(&mut self, key: KeyEvent, _ctx: &mut AppCtx) -> bool {
         match key.code {
-            KeyCode::Enter => {
+            KeyCode::Enter | KeyCode::Char(' ') => {
                 self.open = !self.open;
                 true
             }
-            KeyCode::Up if self.open => {
+            KeyCode::Up | KeyCode::Char('k') if self.open => {
                 if self.selected > 0 {
                     self.selected -= 1;
                 }
                 true
             }
-            KeyCode::Down if self.open => {
+            KeyCode::Down | KeyCode::Char('j') if self.open => {
                 if self.selected + 1 < self.options.len() {
                     self.selected += 1;
                 }
@@ -82,43 +88,33 @@ impl Dropdown {
             _ => false,
         }
     }
-}
 
-impl ThemedWidgetMut for Dropdown {
     fn render(&mut self, area: Rect, buf: &mut Buffer, theme: &Theme) {
-        let layout = Layout::default()
+        let [label, box_block] = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Length(20), Constraint::Min(10)])
-            .split(area);
+            .areas(area);
 
-        buf.set_string(
-            layout[0].x,
-            layout[0].y + 1,
-            &self.label,
-            Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
-        );
+        let label_style = Style::default().fg(theme.text);
+        Paragraph::new(self.label.as_str()).style(label_style).render(label, buf);
 
-        let symbol = if self.open { "▲" } else { "▼" };
-        let text = format!(
-            " {:<width$} {} ",
-            self.selected_label(),
-            symbol,
-            width = layout[1].width.saturating_sub(6) as usize
-        );
+        let border_style = theme.style_border(self.open);
 
-        let border_style = if self.open {
-            Style::default().fg(theme.accent)
-        } else {
-            Style::default().fg(theme.muted)
-        };
+        let arrow = if self.open { " ▲" } else { " ▼" };
+        let display_text = format!(" {}{}", self.selected_label(), arrow);
 
-        Paragraph::new(text)
+        Paragraph::new(display_text)
             .style(Style::default().fg(theme.text).bg(theme.background))
-            .block(Block::default().borders(Borders::ALL).border_style(border_style))
-            .render(layout[1], buf);
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(border_style)
+                    .bg(theme.background),
+            )
+            .render(box_block, buf);
     }
 
-    fn render_overlay(&self, area: Rect, buf: &mut Buffer, theme: &Theme) {
+    fn render_overlay(&mut self, area: Rect, buf: &mut Buffer, theme: &Theme) {
         if !self.open {
             return;
         }
@@ -133,7 +129,7 @@ impl ThemedWidgetMut for Dropdown {
             x: box_area.x,
             y: box_area.y + box_area.height,
             width: box_area.width,
-            height: list_height + 2,
+            height: list_height.saturating_add(2),
         };
 
         Clear.render(list_area, buf);
@@ -143,10 +139,11 @@ impl ThemedWidgetMut for Dropdown {
             .iter()
             .enumerate()
             .map(|(i, opt)| {
-                let mut style = Style::default().fg(theme.text).bg(theme.background);
-                if i == self.selected {
-                    style = style.bg(theme.highlight).add_modifier(Modifier::BOLD);
-                }
+                let style = if i == self.selected {
+                    theme.style_highlight()
+                } else {
+                    Style::default().fg(theme.text).bg(theme.background)
+                };
                 Line::from(Span::styled(format!("  {}", opt.label), style))
             })
             .collect();
@@ -155,8 +152,23 @@ impl ThemedWidgetMut for Dropdown {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(theme.accent)),
+                    .border_style(Style::default().fg(theme.accent))
+                    .bg(theme.background),
             )
             .render(list_area, buf);
+    }
+}
+
+impl FormField for Dropdown {
+    fn value(&self) -> String {
+        self.value().clone()
+    }
+
+    fn set_value(&mut self, value: &str) {
+        self.set_by_value(value);
+    }
+
+    fn is_focused(&self) -> bool {
+        self.open
     }
 }

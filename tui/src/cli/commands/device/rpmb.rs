@@ -10,13 +10,15 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, anyhow};
 use clap::Args;
 use log::info;
-use penumbra::Device;
-use penumbra::core::storage::{RpmbRegion, Storage, StorageType};
+use penumbra::da::extensions::{KeyDeriveId, KeySize};
+use penumbra::{Device, MtkPort, RpmbRegion, Storage, StorageType};
 
 use crate::cli::DeviceCommand;
 use crate::cli::common::{CONN_DA, CommandMetadata};
 use crate::cli::helpers::AntumbraProgress;
 use crate::cli::state::PersistedDeviceState;
+
+const MAX_RPMB_TRANSFER_SECTORS: u32 = u32::MAX / 256;
 
 #[derive(Debug, Args)]
 pub struct RpmbReadArgs {
@@ -44,8 +46,7 @@ pub struct RpmbWriteArgs {
     /// Number of sectors to write.
     #[arg(short, long)]
     pub num_sectors: Option<u32>,
-    /// RPMB authentication key in hex. If omitted on UFS, Antumbra will try device-side
-    /// derivation.
+    /// RPMB authentication key in hex. If omitted, device-side derivation is used.
     #[arg(long)]
     pub key: Option<String>,
     /// File to read the data from.
@@ -57,7 +58,7 @@ pub struct RpmbAuthArgs {
     /// RPMB region to use.
     #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u8).range(0..=3))]
     pub region: u8,
-    /// The authentication key in hex
+    /// The 32-byte authentication key in hex.
     pub key: String,
 }
 
@@ -126,8 +127,53 @@ impl CommandMetadata for RpmbArgs {
     }
 }
 
-fn perform_rpmb_io(
-    dev: &mut Device,
+fn parse_region(value: u8) -> Result<RpmbRegion> {
+    RpmbRegion::try_from(value)
+        .map_err(|_| anyhow!("Invalid RPMB region {value}; expected 0 through 3"))
+}
+
+fn all_regions() -> [RpmbRegion; 4] {
+    [RpmbRegion::R0, RpmbRegion::R1, RpmbRegion::R2, RpmbRegion::R3]
+}
+
+fn decode_rpmb_key(key: &str) -> Result<Vec<u8>> {
+    let value = key.trim().strip_prefix("0x").unwrap_or(key.trim());
+    let key = hex::decode(value)?;
+    if key.len() != 32 {
+        return Err(anyhow!("RPMB key must be exactly 32 bytes / 64 hex characters"));
+    }
+    Ok(key)
+}
+
+fn validate_sector_range(
+    start_sector: u32,
+    num_sectors: u32,
+    max_sectors: Option<u32>,
+) -> Result<()> {
+    if num_sectors == 0 {
+        return Err(anyhow!("RPMB sector count must be greater than 0"));
+    }
+    if num_sectors > MAX_RPMB_TRANSFER_SECTORS {
+        return Err(anyhow!(
+            "RPMB transfer is too large; maximum per command is {MAX_RPMB_TRANSFER_SECTORS} sectors"
+        ));
+    }
+
+    let end = start_sector
+        .checked_add(num_sectors)
+        .ok_or_else(|| anyhow!("RPMB sector range overflows u32"))?;
+    if max_sectors.is_some_and(|max| end > max) {
+        return Err(anyhow!(
+            "RPMB operation is out of bounds! Maximum sectors available: {}",
+            max_sectors.unwrap()
+        ));
+    }
+
+    Ok(())
+}
+
+fn perform_rpmb_io<P: MtkPort>(
+    dev: &mut Device<P>,
     region: RpmbRegion,
     start_sector: u32,
     num_sectors: Option<u32>,
@@ -135,14 +181,31 @@ fn perform_rpmb_io(
     is_read: bool,
 ) -> Result<()> {
     let storage =
-        dev.dev_info.storage().ok_or_else(|| anyhow!("Failed to retrieve storage information"))?;
+        dev.get_storage().ok_or_else(|| anyhow!("Failed to retrieve storage information"))?;
 
     let rpmb_size = storage.get_rpmb_size();
-    let max_sectors = if rpmb_size == 0 { None } else { Some((rpmb_size / 256) as u32) };
-
+    let global_max_sectors = if rpmb_size == 0 {
+        None
+    } else {
+        Some(
+            u32::try_from(rpmb_size / 256)
+                .map_err(|_| anyhow!("Reported RPMB capacity does not fit in u32 sectors"))?,
+        )
+    };
+    let max_sectors = if storage.kind() == StorageType::Ufs {
+        match dev.get_rpmb_region_info(region) {
+            Ok((_, sectors)) if sectors != 0 => Some(sectors),
+            Ok(_) if region == RpmbRegion::R0 => global_max_sectors,
+            Ok(_) => Some(0),
+            Err(_) if region == RpmbRegion::R0 => global_max_sectors,
+            Err(error) => return Err(error.into()),
+        }
+    } else {
+        global_max_sectors
+    };
     let num_sectors = match (num_sectors, max_sectors) {
-        (Some(num_sectors), _) => num_sectors,
-        (None, Some(max_sectors)) => max_sectors.saturating_sub(start_sector),
+        (Some(count), _) => count,
+        (None, Some(max)) => max.saturating_sub(start_sector),
         (None, None) => {
             return Err(anyhow!(
                 "Device did not report RPMB size; pass --num-sectors/-n to specify how many sectors to {}",
@@ -151,35 +214,28 @@ fn perform_rpmb_io(
         }
     };
 
-    if num_sectors == 0 {
-        return Err(anyhow!("RPMB sector count must be greater than 0"));
-    }
+    validate_sector_range(start_sector, num_sectors, max_sectors).with_context(|| {
+        format!("Invalid RPMB {} range", if is_read { "read" } else { "write" })
+    })?;
 
-    if let Some(max_sectors) = max_sectors {
-        if start_sector.saturating_add(num_sectors) > max_sectors {
-            return Err(anyhow!(
-                "RPMB {} out of bounds! Maximum sectors available: {}",
-                if is_read { "read" } else { "write" },
-                max_sectors
-            ));
-        }
-    } else {
+    if max_sectors.is_none() {
         info!(
             "Device did not report RPMB size; using requested sector count without host-side bounds check"
         );
     }
 
     info!(
-        "{} {} sectors from RPMB starting at sector {} {} {}",
+        "{} {} sectors from RPMB region {} starting at sector {} {} {}",
         if is_read { "Reading" } else { "Writing" },
         num_sectors,
+        region as u32,
         start_sector,
         if is_read { "into" } else { "from" },
         file_path.display()
     );
 
     let pb = AntumbraProgress::new(num_sectors as u64 * 256);
-    let mut progress_callback = pb.get_callback(
+    let mut progress = pb.get_callback(
         if is_read { "Reading RPMB..." } else { "Writing RPMB..." },
         if is_read { "RPMB Read Complete!" } else { "RPMB Write Complete!" },
     );
@@ -187,43 +243,39 @@ fn perform_rpmb_io(
     if is_read {
         let file = File::create(file_path)?;
         let mut writer = BufWriter::new(file);
-        dev.read_rpmb(region, start_sector, num_sectors, &mut writer, &mut progress_callback)?;
+        dev.read_rpmb(region, start_sector, num_sectors, &mut writer, &mut progress)?;
         writer.flush()?;
     } else {
         let file = File::open(file_path)?;
         let mut reader = BufReader::new(file);
-        dev.write_rpmb(region, start_sector, num_sectors, &mut reader, &mut progress_callback)?;
+        dev.write_rpmb(region, start_sector, num_sectors, &mut reader, &mut progress)?;
     }
 
     Ok(())
 }
 
-fn decode_rpmb_key(key: &str) -> Result<Vec<u8>> {
-    let key = hex::decode(key.trim())?;
-    if key.len() != 32 {
-        return Err(anyhow!("RPMB key must be exactly 32 bytes / 64 hex characters"));
-    }
-
-    Ok(key)
+fn verify_derived<P: MtkPort>(dev: &mut Device<P>, region: RpmbRegion) -> Result<()> {
+    let key = dev.derive_key_by_id(KeyDeriveId::Rpmb, KeySize::Key256)?;
+    dev.auth_rpmb(region, &key)?;
+    Ok(())
 }
 
-fn erase_rpmb(dev: &mut Device, args: &RpmbEraseArgs) -> Result<()> {
-    let requested_regions: Vec<RpmbRegion> = if args.all_regions {
-        vec![RpmbRegion::R1, RpmbRegion::R2, RpmbRegion::R3, RpmbRegion::R4]
+fn erase_rpmb<P: MtkPort>(dev: &mut Device<P>, args: &RpmbEraseArgs) -> Result<()> {
+    let storage =
+        dev.get_storage().ok_or_else(|| anyhow!("Failed to retrieve storage information"))?;
+    let is_ufs = storage.kind() == StorageType::Ufs;
+    let requested: Vec<RpmbRegion> = if args.all_regions {
+        if is_ufs { all_regions().to_vec() } else { vec![RpmbRegion::R0] }
     } else {
-        vec![RpmbRegion::try_from(args.region.unwrap())
-            .map_err(|_| anyhow!("Invalid RPMB region"))?]
+        vec![parse_region(args.region.expect("clap enforces an erase scope"))?]
     };
 
     let mut regions = Vec::new();
-    for region in requested_regions {
+    for region in requested {
         let (enabled, sectors) = dev.get_rpmb_region_info(region)?;
         if sectors == 0 {
-            if args.all_regions && region != RpmbRegion::R1 {
-                info!(
-                    "RPMB region {} has no configured capacity; skipping it",
-                    region as u32
-                );
+            if args.all_regions && region != RpmbRegion::R0 {
+                info!("RPMB region {} has no configured capacity; skipping it", region as u32);
                 continue;
             }
             return Err(anyhow!(
@@ -252,15 +304,17 @@ fn erase_rpmb(dev: &mut Device, args: &RpmbEraseArgs) -> Result<()> {
                 ));
             }
         }
+
+        validate_sector_range(0, sectors, Some(sectors))?;
         regions.push((region, sectors));
     }
 
     if regions.is_empty() {
-        return Err(anyhow!("No enabled RPMB regions were reported by the device"));
+        return Err(anyhow!("No erasable RPMB regions were reported by the device"));
     }
 
-    // Preflight every region before changing any data. Advanced UFS RPMB
-    // regions can have independent keys and write counters.
+    // Authenticate every target before modifying the first region. Advanced
+    // UFS RPMB regions may have independent authentication state/counters.
     for (region, sectors) in &regions {
         info!(
             "Preflight authenticating RPMB region {} ({} sectors / {} bytes)",
@@ -268,7 +322,7 @@ fn erase_rpmb(dev: &mut Device, args: &RpmbEraseArgs) -> Result<()> {
             sectors,
             *sectors as u64 * 256
         );
-        dev.verify_derived_rpmb_key(*region)
+        verify_derived(dev, *region)
             .with_context(|| format!("RPMB region {} authentication failed", *region as u32))?;
     }
 
@@ -288,20 +342,22 @@ fn erase_rpmb(dev: &mut Device, args: &RpmbEraseArgs) -> Result<()> {
                 region as u32
             )
         })?;
-
     }
 
     info!(
-        "RPMB erase write completed without readback verification. Authentication keys and write counters were not reset."
+        "RPMB erase completed without readback verification. OTP authentication keys and write counters cannot be reset by authenticated writes."
     );
     Ok(())
 }
 
-fn show_rpmb_info(dev: &mut Device, args: &RpmbInfoArgs) -> Result<()> {
-    let regions: Vec<RpmbRegion> = if let Some(region) = args.region {
-        vec![RpmbRegion::try_from(region).map_err(|_| anyhow!("Invalid RPMB region"))?]
-    } else {
-        vec![RpmbRegion::R1, RpmbRegion::R2, RpmbRegion::R3, RpmbRegion::R4]
+fn show_rpmb_info<P: MtkPort>(dev: &mut Device<P>, args: &RpmbInfoArgs) -> Result<()> {
+    let storage =
+        dev.get_storage().ok_or_else(|| anyhow!("Failed to retrieve storage information"))?;
+    let is_ufs = storage.kind() == StorageType::Ufs;
+    let regions: Vec<RpmbRegion> = match args.region {
+        Some(region) => vec![parse_region(region)?],
+        None if is_ufs => all_regions().to_vec(),
+        None => vec![RpmbRegion::R0],
     };
 
     for region in regions {
@@ -323,44 +379,30 @@ fn show_rpmb_info(dev: &mut Device, args: &RpmbInfoArgs) -> Result<()> {
 }
 
 impl DeviceCommand for RpmbArgs {
-    fn run(&self, dev: &mut Device, state: &mut PersistedDeviceState) -> Result<()> {
-        let region_number = match &self.command {
-            RpmbCommand::Read(args) => args.region,
-            RpmbCommand::Write(args) => args.region,
-            RpmbCommand::Auth(args) => args.region,
-            RpmbCommand::VerifyDerived(args) => args.region,
-            RpmbCommand::Erase(args) => args.region.unwrap_or(0),
-            RpmbCommand::Info(args) => args.region.unwrap_or(0),
-        };
-        let region = RpmbRegion::try_from(region_number)
-            .map_err(|_| anyhow!("Invalid RPMB region {region_number}; expected 0 through 3"))?;
-
+    fn run<P: MtkPort>(&self, dev: &mut Device<P>, state: &mut PersistedDeviceState) -> Result<()> {
         dev.enter_da_mode()?;
 
         state.connection_type = CONN_DA;
         state.flash_mode = 1;
 
         match &self.command {
-            RpmbCommand::Read(args) => {
-                perform_rpmb_io(
-                    dev,
-                    region,
-                    args.start_sector,
-                    args.num_sectors,
-                    &args.file,
-                    true,
-                )?;
-            }
+            RpmbCommand::Read(args) => perform_rpmb_io(
+                dev,
+                parse_region(args.region)?,
+                args.start_sector,
+                args.num_sectors,
+                &args.file,
+                true,
+            )?,
             RpmbCommand::Write(args) => {
+                let region = parse_region(args.region)?;
                 let storage = dev
-                    .dev_info
-                    .storage()
+                    .get_storage()
                     .ok_or_else(|| anyhow!("Failed to retrieve storage information"))?;
 
                 if let Some(key) = &args.key {
                     info!("Authenticating RPMB using provided key before write...");
-                    let key = decode_rpmb_key(key)?;
-                    dev.auth_rpmb(region, &key)?;
+                    dev.auth_rpmb(region, &decode_rpmb_key(key)?)?;
                     info!("RPMB authentication was successful!");
                 } else if storage.kind() == StorageType::Ufs {
                     info!(
@@ -379,13 +421,12 @@ impl DeviceCommand for RpmbArgs {
             }
             RpmbCommand::Auth(args) => {
                 info!("Authenticating RPMB using provided key...");
-                let key = decode_rpmb_key(&args.key)?;
-                dev.auth_rpmb(region, &key)?;
+                dev.auth_rpmb(parse_region(args.region)?, &decode_rpmb_key(&args.key)?)?;
                 info!("Authentication was successful!");
             }
-            RpmbCommand::VerifyDerived(_) => {
+            RpmbCommand::VerifyDerived(args) => {
                 info!("Deriving and verifying the device RPMB key without writing RPMB data...");
-                dev.verify_derived_rpmb_key(region)?;
+                verify_derived(dev, parse_region(args.region)?)?;
                 info!("Device-derived RPMB key verification was successful!");
             }
             RpmbCommand::Erase(args) => erase_rpmb(dev, args)?,
@@ -423,39 +464,16 @@ mod tests {
         ])
         .unwrap();
 
-        let RpmbCommand::Read(args) = cli.command else {
-            panic!("expected RPMB read command");
-        };
+        let RpmbCommand::Read(args) = cli.command else { panic!("expected RPMB read") };
         assert_eq!(args.region, 3);
         assert_eq!(args.start_sector, 256);
         assert_eq!(args.num_sectors, Some(200));
     }
 
     #[test]
-    fn parses_write_sector_arguments_with_declared_types() {
-        let cli = TestCli::try_parse_from([
-            "test",
-            "write",
-            "--start-sector",
-            "65536",
-            "--num-sectors",
-            "1",
-            "rpmb.bin",
-        ])
-        .unwrap();
-
-        let RpmbCommand::Write(args) = cli.command else {
-            panic!("expected RPMB write command");
-        };
-        assert_eq!(args.region, 0);
-        assert_eq!(args.start_sector, 65_536);
-        assert_eq!(args.num_sectors, Some(1));
-    }
-
-    #[test]
     fn rejects_out_of_range_region() {
-        let error = TestCli::try_parse_from(["test", "read", "--region", "4", "rpmb.bin"])
-            .unwrap_err();
+        let error =
+            TestCli::try_parse_from(["test", "read", "--region", "4", "rpmb.bin"]).unwrap_err();
         assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
     }
 
@@ -463,74 +481,34 @@ mod tests {
     fn parses_verify_derived_command() {
         let cli = TestCli::try_parse_from(["test", "verify-derived", "--region", "2"]).unwrap();
         let RpmbCommand::VerifyDerived(args) = cli.command else {
-            panic!("expected RPMB verify-derived command");
+            panic!("expected RPMB verify-derived")
         };
         assert_eq!(args.region, 2);
     }
 
     #[test]
-    fn parses_single_region_erase() {
-        let cli = TestCli::try_parse_from(["test", "erase", "--region", "0"]).unwrap();
-        let RpmbCommand::Erase(args) = cli.command else {
-            panic!("expected RPMB erase command");
-        };
-        assert_eq!(args.region, Some(0));
-        assert!(!args.all_regions);
-        assert!(!args.force);
-    }
+    fn erase_requires_exactly_one_scope_and_accepts_force() {
+        assert!(TestCli::try_parse_from(["test", "erase"]).is_err());
+        assert!(
+            TestCli::try_parse_from(["test", "erase", "--region", "0", "--all-regions"]).is_err()
+        );
 
-    #[test]
-    fn parses_all_region_erase() {
-        let cli = TestCli::try_parse_from(["test", "erase", "--all-regions"]).unwrap();
-        let RpmbCommand::Erase(args) = cli.command else {
-            panic!("expected RPMB erase command");
-        };
-        assert!(args.all_regions);
-        assert_eq!(args.region, None);
-        assert!(!args.force);
-    }
-
-    #[test]
-    fn parses_forced_disabled_region_erase() {
-        let cli = TestCli::try_parse_from([
-            "test",
-            "erase",
-            "--region",
-            "2",
-            "--force",
-        ])
-        .unwrap();
-        let RpmbCommand::Erase(args) = cli.command else {
-            panic!("expected RPMB erase command");
-        };
+        let cli = TestCli::try_parse_from(["test", "erase", "--region", "2", "--force"]).unwrap();
+        let RpmbCommand::Erase(args) = cli.command else { panic!("expected RPMB erase") };
         assert_eq!(args.region, Some(2));
         assert!(args.force);
     }
 
     #[test]
-    fn erase_requires_exactly_one_scope() {
-        assert!(TestCli::try_parse_from(["test", "erase"]).is_err());
-        assert!(
-            TestCli::try_parse_from(["test", "erase", "--region", "0", "--all-regions"])
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn parses_rpmb_info_scope() {
+    fn info_defaults_to_all_regions() {
         let cli = TestCli::try_parse_from(["test", "info"]).unwrap();
-        let RpmbCommand::Info(args) = cli.command else {
-            panic!("expected RPMB info command");
-        };
+        let RpmbCommand::Info(args) = cli.command else { panic!("expected RPMB info") };
         assert_eq!(args.region, None);
     }
 
     #[test]
-    fn parses_rpmb_info_single_region_filter() {
-        let cli = TestCli::try_parse_from(["test", "info", "--region", "2"]).unwrap();
-        let RpmbCommand::Info(args) = cli.command else {
-            panic!("expected RPMB info command");
-        };
-        assert_eq!(args.region, Some(2));
+    fn validates_rpmb_key_length() {
+        assert!(decode_rpmb_key(&"aa".repeat(32)).is_ok());
+        assert!(decode_rpmb_key("aa").is_err());
     }
 }

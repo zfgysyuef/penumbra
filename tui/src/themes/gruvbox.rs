@@ -6,7 +6,7 @@ use ratatui::style::Color;
 
 use crate::themes::Theme;
 
-pub fn gruvbox_light() -> Theme {
+pub const fn gruvbox_light() -> Theme {
     Theme {
         name: "Gruvbox",
         id: "gruvbox_light",
@@ -19,22 +19,22 @@ pub fn gruvbox_light() -> Theme {
         highlight: Color::Rgb(235, 219, 178),
         // #3c3836
         text: Color::Rgb(60, 56, 54),
-        // #d65d0e
-        accent: Color::Rgb(204, 36, 29),
-        // #9d0006
+        // #af3a03 faded_orange
+        accent: Color::Rgb(175, 58, 3),
+        // #9d0006 faded_red
         error: Color::Rgb(157, 0, 6),
-        // #d79921
-        warning: Color::Rgb(215, 153, 33),
-        // #458588
-        info: Color::Rgb(69, 133, 136),
-        // #98971a
-        success: Color::Rgb(152, 151, 26),
-        // #a89984
-        muted: Color::Rgb(168, 153, 132),
+        // #b57614 faded_yellow
+        warning: Color::Rgb(181, 118, 20),
+        // #076678 faded_blue
+        info: Color::Rgb(7, 102, 120),
+        // #79740e faded_green
+        success: Color::Rgb(121, 116, 14),
+        // #7c6f64 dark4
+        muted: Color::Rgb(124, 111, 100),
     }
 }
 
-pub fn gruvbox_dark() -> Theme {
+pub const fn gruvbox_dark() -> Theme {
     Theme {
         name: "Gruvbox Dark",
         id: "gruvbox_dark",
@@ -47,17 +47,17 @@ pub fn gruvbox_dark() -> Theme {
         highlight: Color::Rgb(60, 56, 54),
         // #ebdbb2
         text: Color::Rgb(235, 219, 178),
-        // #d65d0e
-        accent: Color::Rgb(204, 36, 29),
-        // #9d0006
-        error: Color::Rgb(157, 0, 6),
-        // #d79921
-        warning: Color::Rgb(215, 153, 33),
-        // #458588
-        info: Color::Rgb(69, 133, 136),
-        // #98971a
-        success: Color::Rgb(152, 151, 26),
-        // #a89984
+        // #fe8019 bright_orange
+        accent: Color::Rgb(254, 128, 25),
+        // #fb4934 bright_red
+        error: Color::Rgb(251, 73, 52),
+        // #fabd2f bright_yellow
+        warning: Color::Rgb(250, 189, 47),
+        // #83a598 bright_blue
+        info: Color::Rgb(131, 165, 152),
+        // #b8bb26 bright_green
+        success: Color::Rgb(184, 187, 38),
+        // #a89984 light4
         muted: Color::Rgb(168, 153, 132),
     }
 }

@@ -10,9 +10,9 @@ use std::path::PathBuf;
 use anyhow::{Result, anyhow};
 use clap::{Args, Subcommand};
 use log::info;
-use penumbra::Device;
-use penumbra::da::DAProtocol;
-use penumbra::da::xflash::flash::set_rsc_info;
+use penumbra::da::DaProtocol;
+use penumbra::da::xflash::set_rsc_info;
+use penumbra::{Device, MtkPort};
 
 use crate::cli::DeviceCommand;
 use crate::cli::common::{CONN_DA, CommandMetadata};
@@ -28,7 +28,7 @@ pub struct RscFlashArgs {
 }
 
 impl DeviceCommand for RscFlashArgs {
-    fn run(&self, dev: &mut Device, state: &mut PersistedDeviceState) -> Result<()> {
+    fn run<P: MtkPort>(&self, dev: &mut Device<P>, state: &mut PersistedDeviceState) -> Result<()> {
         dev.enter_da_mode()?;
         state.connection_type = CONN_DA;
         state.flash_mode = 1;
@@ -38,24 +38,17 @@ impl DeviceCommand for RscFlashArgs {
 
         let file_size = metadata(&self.file)?.len();
 
-        let Some(part) = dev.dev_info.get_partition(&self.partition) else {
-            return Err(anyhow::anyhow!("Partition '{}' not found on device.", self.partition));
+        let Some(part) = dev.get_partition_active(&self.partition) else {
+            return Err(anyhow!("Partition '{}' not found on device.", self.partition));
         };
 
         if file_size > part.size as u64 {
-            return Err(anyhow::anyhow!(
+            return Err(anyhow!(
                 "File size ({}) exceeds partition size ({}).",
                 file_size,
                 part.size
             ));
         }
-
-        let mut proto = dev.get_protocol().unwrap();
-        let xflash = if let DAProtocol::V5(xflash) = &mut proto {
-            xflash
-        } else {
-            return Err(anyhow!("Protocol is not XFlash!"));
-        };
 
         let pb = AntumbraProgress::new(file_size);
 
@@ -63,7 +56,20 @@ impl DeviceCommand for RscFlashArgs {
 
         info!("Flashing file {:?} to partition {} with RSC", self.file, part.name);
 
-        set_rsc_info(xflash, &part.name, file_size as usize, &mut reader, &mut progress_callback)?;
+        dev.with_protocol(|proto, port| {
+            let DaProtocol::V5(xflash) = proto else {
+                return Err(penumbra::error::PenumbraError::WrongProtocolVersion.into());
+            };
+
+            set_rsc_info(
+                xflash,
+                port,
+                &part.name,
+                file_size as usize,
+                &mut reader,
+                &mut progress_callback,
+            )
+        })?;
 
         info!("Flashing to partition '{}' completed.", part.name);
 
@@ -97,7 +103,7 @@ impl CommandMetadata for XFlashArgs {
 }
 
 impl DeviceCommand for XFlashArgs {
-    fn run(&self, dev: &mut Device, state: &mut PersistedDeviceState) -> Result<()> {
+    fn run<P: MtkPort>(&self, dev: &mut Device<P>, state: &mut PersistedDeviceState) -> Result<()> {
         match &self.command {
             XFlashSubcommand::RscFlash(cmd) => cmd.run(dev, state),
         }

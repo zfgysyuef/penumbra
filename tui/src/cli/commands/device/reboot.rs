@@ -5,8 +5,8 @@
 
 use anyhow::Result;
 use clap::{Args, ValueEnum};
-use penumbra::Device;
-use penumbra::da::protocol::BootMode;
+use penumbra::da::BootMode;
+use penumbra::{Device, MtkPort};
 
 use crate::cli::DeviceCommand;
 use crate::cli::common::{CONN_DA, CommandMetadata};
@@ -36,11 +36,11 @@ impl CommandMetadata for RebootArgs {
 impl From<RebootAction> for BootMode {
     fn from(action: RebootAction) -> Self {
         match action {
-            RebootAction::Normal => BootMode::Normal,
-            RebootAction::HomeScreen => BootMode::HomeScreen,
-            RebootAction::Fastboot => BootMode::Fastboot,
-            RebootAction::Test => BootMode::Test,
-            RebootAction::Meta => BootMode::Meta,
+            RebootAction::Normal => Self::Normal,
+            RebootAction::HomeScreen => Self::HomeScreen,
+            RebootAction::Fastboot => Self::Fastboot,
+            RebootAction::Test => Self::Test,
+            RebootAction::Meta => Self::Meta,
         }
     }
 }
@@ -52,7 +52,7 @@ pub struct RebootArgs {
 }
 
 impl DeviceCommand for RebootArgs {
-    fn run(&self, dev: &mut Device, state: &mut PersistedDeviceState) -> Result<()> {
+    fn run<P: MtkPort>(&self, dev: &mut Device<P>, state: &mut PersistedDeviceState) -> Result<()> {
         dev.enter_da_mode()?;
 
         state.connection_type = CONN_DA;

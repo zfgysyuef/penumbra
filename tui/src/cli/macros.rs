@@ -17,6 +17,7 @@ macro_rules! cli_commands {
         pub enum Commands {
             $(
                 #[command(
+                    subcommand_help_heading = "Device Commands",
                     aliases = <$dev_ty as $crate::cli::common::CommandMetadata>::aliases(),
                     visible_aliases = <$dev_ty as $crate::cli::common::CommandMetadata>::visible_aliases(),
                     about = <$dev_ty as $crate::cli::common::CommandMetadata>::about(),
@@ -27,6 +28,7 @@ macro_rules! cli_commands {
             )*
             $(
                 #[command(
+                    subcommand_help_heading = "CLI Commands",
                     aliases = <$loc_ty as $crate::cli::common::CommandMetadata>::aliases(),
                     visible_aliases = <$loc_ty as $crate::cli::common::CommandMetadata>::visible_aliases(),
                     about = <$loc_ty as $crate::cli::common::CommandMetadata>::about(),
@@ -38,7 +40,7 @@ macro_rules! cli_commands {
         }
 
         impl Commands {
-            pub async fn execute(
+            pub fn execute(
                 &self,
                 args: &$crate::cli::CliArgs,
                 state: &mut $crate::cli::state::PersistedDeviceState,
@@ -46,15 +48,39 @@ macro_rules! cli_commands {
                 match self {
                     $(
                         Commands::$dev_variant(inner) => {
-                            let mut dev = $crate::cli::helpers::setup_device(args, state).await?;
+                            let mut da_buf = None;
+                            if let Some(da_path) = &args.da_file {
+                                da_buf = Some(std::fs::read(da_path)?);
+                            } else if let Some(da_path_str) = &state.da_file_path {
+                                da_buf = Some(std::fs::read(std::path::Path::new(da_path_str))?);
+                            }
+
+                            let pl_buf = if let Some(pl_path) = &args.preloader_file { Some(std::fs::read(pl_path)?) } else { None };
+
+                            let auth_buf = if let Some(auth_path) = &args.auth_file { Some(std::fs::read(auth_path)?) } else { None };
+
+                            let mut dev = $crate::cli::helpers::setup_device(
+                                args,
+                                state,
+                                da_buf.as_deref(),
+                                pl_buf.as_deref(),
+                                auth_buf.as_deref()
+                            )?;
+
                             $crate::cli::DeviceCommand::run(inner, &mut dev, state)?;
-                            state.target_config = dev.dev_info.target_config();
+                            state.target_config = dev.devinfo().target_config();
+                            state.usb_log = args.usb_log;
+                            if let Some(da_path) = &args.da_file {
+                                state.da_file_path = Some(da_path.to_string_lossy().to_string());
+                            }
+
                             Ok(())
                         }
+
                     )*
                     $(
                         Commands::$loc_variant(inner) => {
-                            $crate::cli::LocalCommand::run(inner, state)?;
+                            $crate::cli::CliCommand::run(inner, state)?;
                             Ok(())
                         }
                     )*

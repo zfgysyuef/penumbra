@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Result, anyhow};
 use clap::Args;
 use log::info;
-use penumbra::Device;
+use penumbra::{Device, MtkPort};
 
 use crate::cli::DeviceCommand;
 use crate::cli::common::{CONN_DA, CommandMetadata};
@@ -46,7 +46,7 @@ impl CommandMetadata for WriteAllArgs {
 }
 
 impl DeviceCommand for WriteAllArgs {
-    fn run(&self, dev: &mut Device, state: &mut PersistedDeviceState) -> Result<()> {
+    fn run<P: MtkPort>(&self, dev: &mut Device<P>, state: &mut PersistedDeviceState) -> Result<()> {
         let input_dir: &Path = &self.input_dir;
 
         if exists(input_dir).is_err() {
@@ -87,7 +87,7 @@ impl DeviceCommand for WriteAllArgs {
 
             let file_size = metadata(filename)?.len();
 
-            let Some(part) = dev.dev_info.get_partition(&name) else {
+            let Some(part) = dev.devinfo().get_partition(&name) else {
                 if !self.ignore_missing {
                     return Err(anyhow::anyhow!(
                         "Partition '{name}' doesn't exist. This behaviour can be ignored with -i."
@@ -110,11 +110,14 @@ impl DeviceCommand for WriteAllArgs {
 
             info!("Downloading to partition '{}'...", part.name);
 
-            if let Err(e) =
-                dev.download(&part.name, file_size as usize, &mut reader, &mut progress_callback)
-            {
+            if let Err(e) = dev.write_partition(
+                &part.name,
+                file_size as usize,
+                &mut reader,
+                &mut progress_callback,
+            ) {
                 pb.abandon("Download failed!");
-                return Err(e)?;
+                Err(e)?;
             }
 
             info!("Download to partition '{}' completed.", part.name);

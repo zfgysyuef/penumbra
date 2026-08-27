@@ -14,9 +14,10 @@ mod pages;
 #[cfg(feature = "tui")]
 mod themes;
 
+mod auth;
 mod cli;
 mod config;
-mod error;
+mod helpers;
 mod logger;
 
 use anyhow::Result;
@@ -24,17 +25,32 @@ use clap::Parser;
 use cli::{CliArgs, run_cli};
 use logger::init_logger;
 
-#[tokio::main]
-async fn main() -> Result<()> {
+use crate::auth::init_auth;
+use crate::config::AntumbraConfig;
+
+fn main() -> Result<()> {
     let args = CliArgs::parse();
 
-    let cli_mode = args.cli || args.command.is_some() || !cfg!(feature = "tui");
-    let tui_mode = !cli_mode;
+    #[cfg(all(windows, feature = "tui"))]
+    let tui = args.tui || !cli_or_gui::is_launched_from_terminal();
 
-    init_logger(tui_mode, args.verbose);
+    #[cfg(not(all(windows, feature = "tui")))]
+    let tui = args.tui;
 
-    if cli_mode {
-        return run_cli(&args).await;
+    if tui && args.mi_auth {
+        anyhow::bail!(
+            "--mi-auth currently requires CLI mode because SIGN entry uses the terminal standard input"
+        );
+    }
+
+    init_logger(tui, args.verbose);
+
+    let config = AntumbraConfig::load()?;
+
+    init_auth(config.clone(), args.mi_auth, args.auth_file.as_deref())?;
+
+    if !tui || !cfg!(feature = "tui") {
+        return run_cli(&args, &config);
     }
 
     #[cfg(feature = "tui")]
@@ -42,13 +58,14 @@ async fn main() -> Result<()> {
         use app::App;
 
         let mut terminal = ratatui::init();
-        let mut app = App::new(&args);
+        let mut app = App::new(&args, config);
 
-        let app_result = app.run(&mut terminal).await;
+        let app_result = app.run(&mut terminal);
 
         ratatui::restore();
-        return app_result;
+        app_result
     }
 
+    #[cfg(not(feature = "tui"))]
     unreachable!()
 }

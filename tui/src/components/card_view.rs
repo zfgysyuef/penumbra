@@ -1,5 +1,5 @@
 /*
-    SPDX-License-Identifier:  AGPL-3.0-or-later
+    SPDX-License-Identifier: AGPL-3.0-or-later
     SPDX-FileCopyrightText: 2025-2026 Shomy
 */
 use ratatui::buffer::Buffer;
@@ -14,7 +14,7 @@ pub struct Card<'a> {
 }
 
 impl<'a> Card<'a> {
-    pub fn new(label: &'a str, value: &'a str, width: u16, border_style: Style) -> Self {
+    pub const fn new(label: &'a str, value: &'a str, width: u16, border_style: Style) -> Self {
         Self { label, value, width, border_style }
     }
 
@@ -58,16 +58,13 @@ impl<'a> Card<'a> {
     }
 }
 
-/// Row of cards, handles spacing and centering
 pub struct CardRow<'a> {
-    /// Cards to render
     pub cards: Vec<Card<'a>>,
-    /// horizontal padding between cards
     pub pad: u16,
 }
 
 impl<'a> CardRow<'a> {
-    pub fn new(cards: Vec<Card<'a>>, pad: u16) -> Self {
+    pub const fn new(cards: Vec<Card<'a>>, pad: u16) -> Self {
         Self { cards, pad }
     }
 

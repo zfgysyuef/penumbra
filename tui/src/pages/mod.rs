@@ -13,14 +13,13 @@ pub use welcome::WelcomePage;
 
 use crate::app::AppCtx;
 
-// TODO: Make a better logo to replace this placeholder one
 pub const LOGO: &str = include_str!("../logo.txt");
+pub const LOGO_ASCII: &str = include_str!("../logo_ascii.txt");
 
-#[async_trait::async_trait]
 pub trait Page {
     fn render(&mut self, frame: &mut Frame<'_>, ctx: &mut AppCtx);
-    async fn handle_input(&mut self, ctx: &mut AppCtx, key: KeyEvent);
-    async fn on_enter(&mut self, _ctx: &mut AppCtx) {}
-    async fn on_exit(&mut self, _ctx: &mut AppCtx) {}
-    async fn update(&mut self, _ctx: &mut AppCtx) {}
+    fn handle_input(&mut self, ctx: &mut AppCtx, key: KeyEvent);
+    fn on_enter(&mut self, _ctx: &mut AppCtx) {}
+    fn on_exit(&mut self, _ctx: &mut AppCtx) {}
+    fn update(&mut self, _ctx: &mut AppCtx) {}
 }

@@ -4,17 +4,17 @@
 */
 #[macro_use]
 mod macros;
-mod cmds;
-mod da_protocol;
-#[cfg(not(feature = "no_exploits"))]
+mod cmd;
+#[cfg(feature = "exploits")]
 mod exts;
-pub mod flash;
-#[cfg(not(feature = "no_exploits"))]
+mod flash;
+#[cfg(feature = "exploits")]
 mod patch;
-#[cfg(not(feature = "no_exploits"))]
-mod sec;
+mod protocol;
 mod storage;
 mod structs;
-mod xflash_lib;
-pub use cmds::*;
-pub use xflash_lib::*;
+pub use cmd::Cmd;
+pub use flash::set_rsc_info;
+#[cfg(feature = "exploits")]
+pub use patch::{patch_da, patch_da1, patch_da2};
+pub use protocol::XFlash;

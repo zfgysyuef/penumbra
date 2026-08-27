@@ -6,8 +6,8 @@
 use anyhow::Result;
 use clap::{Args, ValueEnum};
 use log::info;
-use penumbra::Device;
-use penumbra::core::seccfg::LockFlag;
+use penumbra::hacc::LockState;
+use penumbra::{Device, MtkPort};
 
 use crate::cli::DeviceCommand;
 use crate::cli::common::{CONN_DA, CommandMetadata};
@@ -37,7 +37,7 @@ impl CommandMetadata for SeccfgArgs {
 }
 
 impl DeviceCommand for SeccfgArgs {
-    fn run(&self, dev: &mut Device, state: &mut PersistedDeviceState) -> Result<()> {
+    fn run<P: MtkPort>(&self, dev: &mut Device<P>, state: &mut PersistedDeviceState) -> Result<()> {
         dev.enter_da_mode()?;
 
         state.connection_type = CONN_DA;
@@ -46,23 +46,17 @@ impl DeviceCommand for SeccfgArgs {
         match self.action {
             SeccfgAction::Unlock => {
                 info!("Unlocking seccfg...");
-                match dev.set_seccfg_lock_state(LockFlag::Unlock) {
-                    Some(_) => (),
-                    None => {
-                        info!("Failed to unlock seccfg or already unlocked.");
-                        return Ok(());
-                    }
+                if dev.set_seccfg_lock_state(LockState::Unlock).is_err() {
+                    info!("Failed to unlock seccfg or already unlocked.");
+                    return Ok(());
                 }
                 info!("Unlocked seccfg!");
             }
             SeccfgAction::Lock => {
                 info!("Locking seccfg partition...");
-                match dev.set_seccfg_lock_state(LockFlag::Lock) {
-                    Some(_) => (),
-                    None => {
-                        info!("Failed to lock seccfg or already locked.");
-                        return Ok(());
-                    }
+                if dev.set_seccfg_lock_state(LockState::Lock).is_err() {
+                    info!("Failed to lock seccfg or already locked.");
+                    return Ok(());
                 }
                 info!("Locked seccfg!");
             }
