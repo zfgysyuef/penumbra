@@ -382,6 +382,11 @@ impl DownloadProtocol for Xml {
     }
 
     #[cfg(not(feature = "no_exploits"))]
+    fn get_rpmb_region_info(&mut self, region: RpmbRegion) -> Result<(bool, u32)> {
+        exts::get_rpmb_region_info(self, region)
+    }
+
+    #[cfg(not(feature = "no_exploits"))]
     fn patch_da(&mut self) -> Option<DA> {
         patch::patch_da(self).ok()
     }

@@ -78,9 +78,12 @@ pub struct RpmbEraseArgs {
         required_unless_present = "all_regions"
     )]
     pub region: Option<u8>,
-    /// Erase every enabled RPMB region after all regions pass authentication.
+    /// Erase every reported RPMB region; disabled regions require --force.
     #[arg(long, conflicts_with = "region", required_unless_present = "region")]
     pub all_regions: bool,
+    /// Attempt erase even when the selected region is reported disabled.
+    #[arg(long)]
+    pub force: bool,
 }
 
 #[derive(Debug, Args)]
@@ -214,16 +217,40 @@ fn erase_rpmb(dev: &mut Device, args: &RpmbEraseArgs) -> Result<()> {
 
     let mut regions = Vec::new();
     for region in requested_regions {
-        let sectors = dev.get_rpmb_sector_count(region)?;
+        let (enabled, sectors) = dev.get_rpmb_region_info(region)?;
         if sectors == 0 {
             if args.all_regions && region != RpmbRegion::R1 {
-                info!("RPMB region {} is disabled; skipping it", region as u32);
+                info!(
+                    "RPMB region {} has no configured capacity; skipping it",
+                    region as u32
+                );
                 continue;
             }
             return Err(anyhow!(
                 "RPMB region {} capacity is unavailable; refusing whole-region erase",
                 region as u32
             ));
+        }
+
+        if !enabled {
+            if args.force {
+                log::warn!(
+                    "RPMB region {} is reported disabled; --force was supplied, attempting erase using its configured {} sectors",
+                    region as u32,
+                    sectors
+                );
+            } else if args.all_regions {
+                info!(
+                    "RPMB region {} is disabled; skipping it (use --force to attempt it)",
+                    region as u32
+                );
+                continue;
+            } else {
+                return Err(anyhow!(
+                    "RPMB region {} is disabled; pass --force to attempt erasing it anyway",
+                    region as u32
+                ));
+            }
         }
         regions.push((region, sectors));
     }
@@ -278,12 +305,13 @@ fn show_rpmb_info(dev: &mut Device, args: &RpmbInfoArgs) -> Result<()> {
     };
 
     for region in regions {
-        let sectors = dev.get_rpmb_sector_count(region)?;
+        let (enabled, sectors) = dev.get_rpmb_region_info(region)?;
+        let status = if enabled { "enabled" } else { "disabled" };
         if sectors == 0 {
-            info!("RPMB region {}: disabled or capacity unavailable", region as u32);
+            info!("RPMB region {}: {status}, capacity unavailable", region as u32);
         } else {
             info!(
-                "RPMB region {}: {} sectors, {} bytes ({:.2} MiB)",
+                "RPMB region {}: {status}, {} sectors, {} bytes ({:.2} MiB)",
                 region as u32,
                 sectors,
                 sectors as u64 * 256,
@@ -448,6 +476,7 @@ mod tests {
         };
         assert_eq!(args.region, Some(0));
         assert!(!args.all_regions);
+        assert!(!args.force);
     }
 
     #[test]
@@ -458,6 +487,24 @@ mod tests {
         };
         assert!(args.all_regions);
         assert_eq!(args.region, None);
+        assert!(!args.force);
+    }
+
+    #[test]
+    fn parses_forced_disabled_region_erase() {
+        let cli = TestCli::try_parse_from([
+            "test",
+            "erase",
+            "--region",
+            "2",
+            "--force",
+        ])
+        .unwrap();
+        let RpmbCommand::Erase(args) = cli.command else {
+            panic!("expected RPMB erase command");
+        };
+        assert_eq!(args.region, Some(2));
+        assert!(args.force);
     }
 
     #[test]

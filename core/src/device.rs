@@ -194,6 +194,25 @@ impl Device {
     /// assert_eq!(device.connected, true);
     /// ```
     pub fn init(&mut self) -> Result<()> {
+        self.init_inner(None)
+    }
+
+    /// Initializes the device and completes the Preloader/BROM one-time SLA
+    /// challenge before attempting any protected command.
+    ///
+    /// `signer` receives the device-specific BLOB and must return its raw
+    /// signature. The challenge is valid only for the current connection.
+    pub fn init_with_brom_sla<F>(&mut self, mut signer: F) -> Result<()>
+    where
+        F: FnMut(&[u8]) -> Result<Vec<u8>>,
+    {
+        self.init_inner(Some(&mut signer))
+    }
+
+    fn init_inner(
+        &mut self,
+        brom_sla_signer: Option<&mut dyn FnMut(&[u8]) -> Result<Vec<u8>>>,
+    ) -> Result<()> {
         let mut conn = self
             .connection
             .take()
@@ -201,10 +220,45 @@ impl Device {
 
         conn.handshake()?;
 
-        let soc_id = conn.get_soc_id()?;
-        let meid = conn.get_meid()?;
+        if brom_sla_signer.is_some() && conn.connection_type == ConnectionType::Da {
+            return Err(Error::penumbra(
+                "Preloader/BROM MI authentication cannot run after the device has entered DA mode",
+            ));
+        }
+
         let hw_code = conn.get_hw_code()?;
-        let target_config = conn.get_target_config()?;
+        let mut soc_id = conn.get_soc_id()?;
+        let mut target_config = conn.get_target_config()?;
+
+        // SP Flash Tool performs standard tool authentication before asking
+        // BROM for the one-time SLA challenge. Requesting command 0xE3 first
+        // makes Xiaomi BROM return 0x7017 (tool auth is null).
+        if target_config & 0x6 != 0 && conn.connection_type == ConnectionType::Brom {
+            if let Some(auth) = &self.auth_data {
+                conn.send_auth(auth)?;
+            } else if brom_sla_signer.is_some() {
+                return Err(Error::penumbra(
+                    "BROM SLA/DAA security is enabled; --mi-auth requires a matching --auth file before the one-time challenge can be requested",
+                ));
+            }
+        }
+
+        if let Some(signer) = brom_sla_signer {
+            // Match SP Flash Tool by refreshing security state after the AUTH
+            // file was accepted. Only request a BLOB if SLA remains enabled.
+            target_config = conn.get_target_config()?;
+            if target_config & 0x2 != 0 {
+                soc_id = conn.get_soc_id()?;
+                info!("Requesting the one-time Preloader/BROM MI authentication challenge...");
+                conn.complete_brom_sla(&soc_id, signer)?;
+            } else {
+                info!("BROM SLA is no longer enabled after AUTH; no one-time challenge is needed");
+            }
+        }
+
+        // Some stock preloaders gate MEID and other commands until AUTH/SLA
+        // succeeds, so retrieve it only after the security flow.
+        let meid = conn.get_meid()?;
 
         let device_info = DevInfoData {
             soc_id,
@@ -223,13 +277,6 @@ impl Device {
         }
 
         self.dev_info.set_chip(chip);
-
-        if self.dev_info.daa_enabled()
-            && conn.connection_type == ConnectionType::Brom
-            && let Some(auth) = &self.auth_data
-        {
-            conn.send_auth(auth)?;
-        }
 
         if self.da_data.is_some() {
             self.protocol = Some(self.init_da_protocol(conn)?);
@@ -1069,5 +1116,14 @@ impl Device {
 
         let protocol = self.protocol.as_mut().unwrap();
         protocol.get_rpmb_sector_count(region)
+    }
+
+    /// Returns the enabled status and configured 256-byte sector count of an RPMB region.
+    #[cfg(not(feature = "no_exploits"))]
+    pub fn get_rpmb_region_info(&mut self, region: RpmbRegion) -> Result<(bool, u32)> {
+        self.ensure_da_mode()?;
+
+        let protocol = self.protocol.as_mut().unwrap();
+        protocol.get_rpmb_region_info(region)
     }
 }

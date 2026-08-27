@@ -502,13 +502,19 @@ pub fn verify_derived_rpmb_key(xml: &mut Xml, region: RpmbRegion) -> Result<()> 
 }
 
 pub fn get_rpmb_sector_count(xml: &mut Xml, region: RpmbRegion) -> Result<u32> {
+    get_rpmb_region_info(xml, region).map(|(_, sectors)| sectors)
+}
+
+pub fn get_rpmb_region_info(xml: &mut Xml, region: RpmbRegion) -> Result<(bool, u32)> {
     ensure_rpmb_extensions(xml)?;
 
     xmlcmd!(xml, ExtRpmbInfo, region as u32)?;
     let response = xml.get_upload_file_resp()?;
     xml.lifetime_ack(XmlCmdLifetime::CmdEnd)?;
 
-    get_tag::<u32>(&response, "sector_count")
+    let enabled = get_tag::<String>(&response, "enabled")? == "yes";
+    let sectors = get_tag::<u32>(&response, "sector_count")?;
+    Ok((enabled, sectors))
 }
 
 pub fn read_rpmb<W, F>(

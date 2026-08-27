@@ -441,6 +441,12 @@ impl DownloadProtocol for XFlash {
     }
 
     #[cfg(not(feature = "no_exploits"))]
+    fn get_rpmb_region_info(&mut self, region: RpmbRegion) -> Result<(bool, u32)> {
+        let sectors = self.get_rpmb_sector_count(region)?;
+        Ok((sectors != 0, sectors))
+    }
+
+    #[cfg(not(feature = "no_exploits"))]
     fn patch_da(&mut self) -> Option<DA> {
         patch::patch_da(self).ok()
     }

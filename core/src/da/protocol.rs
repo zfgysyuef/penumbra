@@ -277,6 +277,10 @@ pub trait DownloadProtocol {
     #[cfg(not(feature = "no_exploits"))]
     fn get_rpmb_sector_count(&mut self, region: RpmbRegion) -> Result<u32>;
 
+    /// Returns whether an RPMB region is enabled and its configured sector count.
+    #[cfg(not(feature = "no_exploits"))]
+    fn get_rpmb_region_info(&mut self, region: RpmbRegion) -> Result<(bool, u32)>;
+
     // DA Patching utils. These *must* be protocol specific, as different protocols
     // have different DA implementations
     #[cfg(not(feature = "no_exploits"))]

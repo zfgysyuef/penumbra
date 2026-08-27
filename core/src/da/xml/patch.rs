@@ -37,7 +37,7 @@ pub fn patch_da2(xml: &Xml) -> Result<DAEntryRegion> {
     let is_arm64 = xml.da.is_arm64();
     let analyzer = create_analyzer(da2.data.clone(), da2.addr as u64, to_arch(is_arm64));
 
-    patch_security(&mut da2, analyzer.as_ref(), is_arm64)?;
+    patch_security(&mut da2, analyzer.as_ref(), is_arm64, !xml.force_heapb8)?;
     patch_boot_to(&mut da2, analyzer.as_ref(), is_arm64)?;
 
     Ok(da2)
@@ -85,10 +85,19 @@ fn patch_security(
     da: &mut DAEntryRegion,
     analyzer: &dyn ArchAnalyzer,
     is_arm64: bool,
+    patch_sla_registration: bool,
 ) -> Result<bool> {
     patch_lock_state(da, analyzer, is_arm64)?;
     patch_sec_policy(da, analyzer, is_arm64)?;
-    patch_da_sla(da, analyzer, is_arm64)
+    if patch_sla_registration {
+        patch_da_sla(da, analyzer, is_arm64)
+    } else {
+        // Forced HeapBait patches the live verifier and completes the dummy
+        // SLA handshake after DA2 starts. Preserve the original GET-DEV-FW
+        // registration so HeapBait can fetch the required device context.
+        info!("Preserving DA SLA command registration for forced HeapBait");
+        Ok(true)
+    }
 }
 
 fn patch_lock_state(

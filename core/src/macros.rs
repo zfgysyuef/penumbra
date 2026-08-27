@@ -6,11 +6,21 @@ macro_rules! exploit {
             if $proto.patch {
                 let mut exploit = <$exploit>::new();
 
-                if let Ok(result) = <$exploit as Exploit<Self>>::run(&mut exploit, $proto) {
-                    $proto.patch = !result;
-                    if let Some(patched_da) = <$exploit as Exploit<Self>>::get_patched_da(&exploit)
-                    {
-                        $proto.da = patched_da;
+                match <$exploit as Exploit<Self>>::run(&mut exploit, $proto) {
+                    Ok(result) => {
+                        $proto.patch = !result;
+                        if let Some(patched_da) =
+                            <$exploit as Exploit<Self>>::get_patched_da(&exploit)
+                        {
+                            $proto.da = patched_da;
+                        }
+                    }
+                    Err(error) => {
+                        log::warn!(
+                            "[Exploit] {} failed: {}",
+                            std::any::type_name::<$exploit>(),
+                            error
+                        );
                     }
                 }
             }

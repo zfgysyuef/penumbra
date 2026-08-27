@@ -42,6 +42,9 @@ pub struct CliArgs {
     /// Force HeapB8/HeapBait instead of Carbonara on XML/V6 DAs
     #[arg(long = "force-heapb8", global = true)]
     pub force_heapb8: bool,
+    /// Complete Xiaomi Preloader/BROM authentication with an externally signed one-time BLOB
+    #[arg(long = "mi-auth", global = true)]
+    pub mi_auth: bool,
 
     /// Subcommands for CLI mode. If provided, TUI mode will be disabled.
     #[command(subcommand)]
@@ -112,6 +115,15 @@ mod tests {
     }
 
     #[test]
+    fn parses_mi_auth_global_flag_before_or_after_subcommand() {
+        let before = CliArgs::try_parse_from(["antumbra", "--mi-auth", "rpmb", "info"]).unwrap();
+        let after = CliArgs::try_parse_from(["antumbra", "rpmb", "info", "--mi-auth"]).unwrap();
+
+        assert!(before.mi_auth);
+        assert!(after.mi_auth);
+    }
+
+    #[test]
     fn parses_top_level_rpmb_read_types() {
         let args = CliArgs::try_parse_from([
             "antumbra",
@@ -174,6 +186,7 @@ mod tests {
         };
         assert_eq!(erase.region, Some(0));
         assert!(!erase.all_regions);
+        assert!(!erase.force);
     }
 
     #[test]
